@@ -2,12 +2,17 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 每天台灣時間 10:00（UTC 02:00）自動執行
-    - cron: "0 2 * * 1-5"
-  workflow_dispatch: # 允許手動觸發
+    # 9:50 AM 台灣時間（UTC+8）= UTC 01:50，週一至週五
+    - cron: "50 1 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "執行模式（fetch / send / all）"
+        required: false
+        default: "all"
 
 jobs:
-  daily-bond-fetch:
+  fetch-and-send:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -24,17 +29,35 @@ jobs:
       - name: 📦 安裝套件
         run: pip install -r requirements.txt
 
-      - name: 🚀 執行每日抓取與通知
+      # ── Step 1：9:50 抓取資料並生成 complete_report ──
+      - name: 📡 9:50 抓取 Telegram 訊息並生成報告
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
+          PYTHONIOENCODING: utf-8
+        run: python main.py fetch
+
+      # ── Step 2：等待至 10:00（約 10 分鐘）──
+      - name: ⏳ 等待至 10:00 AM 台灣時間
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          echo "目前時間（UTC）: $(date -u)"
+          echo "等待 600 秒（10 分鐘）至 10:00 AM 台灣時間..."
+          sleep 600
+          echo "發送時間（UTC）: $(date -u)"
+
+      # ── Step 3：10:00 發送 complete_report ──
+      - name: 📤 10:00 傳送 complete_report 至 Telegram Bot
+        env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
-        run: python main.py
+          PYTHONIOENCODING: utf-8
+        run: python main.py send
 
-      - name: 📤 上傳每日報告（Artifact，保留 30 天）
+      # ── 上傳報告備份 ──
+      - name: 📦 上傳每日報告（Artifact，保留 30 天）
         if: always()
         uses: actions/upload-artifact@v4
         with:
