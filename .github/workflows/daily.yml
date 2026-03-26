@@ -2,8 +2,8 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 9:50 AM 台灣時間（UTC+8）= UTC 01:50，週一至週五
-    - cron: "50 1 * * 1-5"
+    # 23:20 台灣時間（UTC+8）= UTC 15:20，週一至週五
+    - cron: "20 15 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
@@ -29,8 +29,8 @@ jobs:
       - name: 📦 安裝套件
         run: pip install -r requirements.txt
 
-      # ── Step 1：9:50 執行 auto_telegram_daily.py（抓取 + 格式化）──
-      - name: 📡 9:50 執行 auto_telegram_daily.py 抓取並生成 complete_report
+      # ── Step 1：23:20 執行 auto_telegram_daily.py（抓取 + 格式化）──
+      - name: 📡 23:20 執行 auto_telegram_daily.py 抓取並生成 complete_report
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -40,16 +40,16 @@ jobs:
         run: python main.py fetch
 
       # ── Step 2：等待至 10:00（排程時才等待，手動觸發跳過）──
-      - name: ⏳ 等待至 10:00 AM 台灣時間
+      - name: ⏳ 等待至 23:30 台灣時間
         if: ${{ github.event_name == 'schedule' }}
         run: |
           echo "抓取完成時間（UTC）: $(date -u)"
-          echo "等待 600 秒（10 分鐘）..."
+          echo "等待 600 秒（10 分鐘）至 23:30 台灣時間..."
           sleep 600
           echo "發送時間（UTC）: $(date -u)"
 
-      # ── Step 3：10:00 傳送 complete_report 至 Telegram Bot ──
-      - name: 📤 10:00 傳送 complete_report 至 Telegram Bot
+      # ── Step 3：23:30 傳送 complete_report 至 Telegram Bot ──
+      - name: 📤 23:30 傳送轉換公司債公告至 Telegram Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
