@@ -96,6 +96,28 @@ def mode_fetch() -> None:
 
 
 # ─────────────────────────────────────────
+# 讀取 Bot 憑證（環境變數 → 本機 config 檔）
+# ─────────────────────────────────────────
+def load_bot_credentials() -> tuple[str, str]:
+    """回傳 (bot_token, chat_id)，優先讀環境變數，其次讀本機 config"""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    # 若環境變數未設，嘗試讀本機設定檔
+    if not bot_token or not chat_id:
+        cfg_path = os.path.join("configs", "telegram_bot_config.json")
+        if os.path.exists(cfg_path):
+            import json
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            bot_token = bot_token or cfg.get("bot_token", "").strip()
+            chat_id   = chat_id   or cfg.get("chat_id", "").strip()
+            safe_print(f"ℹ️  使用本機 {cfg_path}")
+
+    return bot_token, chat_id
+
+
+# ─────────────────────────────────────────
 # MODE: send — 讀取 complete_report 並傳送
 # ─────────────────────────────────────────
 def mode_send() -> None:
@@ -103,11 +125,17 @@ def mode_send() -> None:
     safe_print(f"📤 [SEND] {datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
     safe_print("=" * 55)
 
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    bot_token, chat_id = load_bot_credentials()
 
-    if not bot_token or not chat_id:
-        safe_print("❌ 缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，請設定 GitHub Secrets")
+    if not bot_token:
+        safe_print("❌ 缺少 TELEGRAM_BOT_TOKEN，請在 configs/telegram_bot_config.json 或 GitHub Secrets 設定")
+        sys.exit(1)
+    if not chat_id or "請填入" in chat_id:
+        safe_print("❌ 尚未設定 TELEGRAM_CHAT_ID")
+        safe_print("   請開啟瀏覽器前往：")
+        safe_print(f"   https://api.telegram.org/bot{bot_token}/getUpdates")
+        safe_print("   先對 Bot 傳一則訊息，再從 JSON 中找 \"id\" 的數值")
+        safe_print("   填入 configs/telegram_bot_config.json 的 chat_id 欄位")
         sys.exit(1)
 
     path = report_path()
