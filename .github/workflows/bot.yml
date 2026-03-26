@@ -1,0 +1,37 @@
+name: Telegram Bot 指令監聽（24/7）
+
+on:
+  schedule:
+    # 每 5 小時重啟一次（GitHub Actions 最長跑 6 小時）
+    # UTC: 0, 5, 10, 15, 20 點 → 台灣時間 8, 13, 18, 23, 4 點
+    - cron: "0 0,5,10,15,20 * * *"
+  workflow_dispatch:   # 手動啟動
+
+permissions:
+  contents: read
+
+jobs:
+  bot-listener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330   # 5.5 小時（確保不被 6 小時限制強殺）
+
+    steps:
+      - name: 📥 Checkout 程式碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 🤖 啟動 Telegram Bot 監聽（最多 5 小時）
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONIOENCODING: utf-8
+        run: python bot_listener.py
