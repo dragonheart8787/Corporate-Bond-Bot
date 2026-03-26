@@ -37,27 +37,47 @@ def report_path() -> str:
 # ─────────────────────────────────────────
 def send_telegram(token: str, chat_id: str, text: str) -> bool:
     import requests
+    import time
 
     chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
     total = len(chunks)
-    success = True
+    failed = []
+
     for idx, chunk in enumerate(chunks, 1):
         header = f"[{idx}/{total}]\n" if total > 1 else ""
-        try:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": header + chunk},
-                timeout=30,
-            )
-            if resp.ok:
-                safe_print(f"  ✅ 已發送第 {idx}/{total} 段")
-            else:
-                safe_print(f"  ⚠️ 第 {idx} 段失敗：{resp.status_code} {resp.text[:200]}")
-                success = False
-        except Exception as e:
-            safe_print(f"  ❌ 發送錯誤：{e}")
-            success = False
-    return success
+        sent = False
+        for attempt in range(3):          # 最多重試 3 次
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": header + chunk},
+                    timeout=30,
+                )
+                if resp.ok:
+                    safe_print(f"  ✅ 已發送第 {idx}/{total} 段")
+                    sent = True
+                    break
+                elif resp.status_code == 429:   # 頻率限制
+                    wait = int(resp.json().get("parameters", {}).get("retry_after", 5))
+                    safe_print(f"  ⏳ 頻率限制，等待 {wait} 秒後重試...")
+                    time.sleep(wait)
+                else:
+                    safe_print(f"  ⚠️ 第 {idx} 段失敗（{resp.status_code}），重試 {attempt+1}/3...")
+                    time.sleep(2)
+            except Exception as e:
+                safe_print(f"  ⚠️ 第 {idx} 段錯誤（{e}），重試 {attempt+1}/3...")
+                time.sleep(3)
+
+        if not sent:
+            safe_print(f"  ❌ 第 {idx} 段最終失敗，跳過")
+            failed.append(idx)
+
+        time.sleep(0.3)   # 避免連續傳送過快
+
+    if failed:
+        safe_print(f"  ⚠️ 共 {len(failed)} 段失敗：{failed}")
+        return False
+    return True
 
 
 # ─────────────────────────────────────────

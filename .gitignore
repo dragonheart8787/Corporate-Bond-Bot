@@ -2,8 +2,9 @@
 *.session
 *.session-journal
 
-# 本機設定（含 api_id / api_hash / phone）
+# 本機設定（含敏感憑證，不可上傳）
 configs/telegram_api.json
+configs/telegram_bot_config.json
 
 # Python 暫存
 __pycache__/
