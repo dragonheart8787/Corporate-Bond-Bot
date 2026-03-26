@@ -1,0 +1,43 @@
+name: 每日公司債自動抓取與 Telegram 通知
+
+on:
+  schedule:
+    # 每天台灣時間 10:00（UTC 02:00）自動執行
+    - cron: "0 2 * * 1-5"
+  workflow_dispatch: # 允許手動觸發
+
+jobs:
+  daily-bond-fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout 程式碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 🚀 執行每日抓取與通知
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
+        run: python main.py
+
+      - name: 📤 上傳每日報告（Artifact，保留 30 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-reports-${{ github.run_number }}
+          path: outputs/daily/
+          retention-days: 30

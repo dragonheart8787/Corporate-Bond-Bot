@@ -1,0 +1,33 @@
+# Telegram session 檔（含登入憑證，絕對不可上傳）
+*.session
+*.session-journal
+
+# 本機設定（含 api_id / api_hash / phone）
+configs/telegram_api.json
+
+# Python 暫存
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# 輸出資料（可選擇不上傳原始資料）
+outputs/
+
+# Excel / 資料檔
+*.xlsx
+*.xls
+*.csv
+
+# 日誌
+*.log
+
+# 系統
+.DS_Store
+Thumbs.db
+
+# VS Code / Cursor
+.vscode/
+.cursor/
