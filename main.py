@@ -138,6 +138,48 @@ def load_bot_credentials() -> tuple[str, str]:
 
 
 # ─────────────────────────────────────────
+# 過濾：只保留「轉換公司債」分類的公告
+# ─────────────────────────────────────────
+CB_KEYWORDS = ["轉換公司債", "可轉債", "可轉換公司債", "轉債"]
+
+def filter_cb_only(full_report: str) -> str:
+    """從 complete_report 中只保留轉換公司債相關公告段落"""
+    SEP = "=" * 80       # complete_formatter 用的公告分隔線
+
+    # 分割成各個區塊（分隔線本身不保留）
+    blocks = full_report.split(SEP)
+
+    # 第一個區塊是總覽標頭（含日期、總計、CB則數）→ 一定保留
+    header = blocks[0] if blocks else ""
+
+    # 篩選含有 CB 關鍵字的公告區塊
+    cb_blocks = [
+        b for b in blocks[1:]
+        if any(kw in b for kw in CB_KEYWORDS)
+    ]
+
+    if not cb_blocks:
+        date_str = datetime.now(TW).strftime("%Y-%m-%d")
+        return f"📊 公司債每日報告 {date_str}\n\n今日無轉換公司債相關公告。"
+
+    # 重新組合：標頭 + 分隔線 + 每則 CB 公告
+    result_parts = [header.rstrip()]
+    for b in cb_blocks:
+        result_parts.append(SEP)
+        result_parts.append(b.strip())
+
+    date_str = datetime.now(TW).strftime("%Y-%m-%d")
+    total = len(cb_blocks)
+    intro = (
+        f"🔴 轉換公司債公告 {date_str}  共 {total} 則\n"
+        + "=" * 55
+    )
+    return intro + "\n\n" + ("\n\n" + SEP + "\n").join(
+        b.strip() for b in cb_blocks
+    )
+
+
+# ─────────────────────────────────────────
 # MODE: send — 讀取 complete_report 並傳送
 # ─────────────────────────────────────────
 def mode_send() -> None:
@@ -164,9 +206,11 @@ def mode_send() -> None:
         sys.exit(1)
 
     with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+        full_content = f.read()
 
-    safe_print(f"📄 報告路徑：{path}（{len(content):,} 字元）")
+    # ── 只保留轉換公司債段落 ──
+    content = filter_cb_only(full_content)
+    safe_print(f"📄 報告路徑：{path}（原始 {len(full_content):,} 字元 → 過濾後 {len(content):,} 字元）")
     safe_print("▶ 傳送至 Telegram Bot ...")
 
     ok = send_telegram(bot_token, chat_id, content)
