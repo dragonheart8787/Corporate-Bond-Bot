@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "執行模式（fetch / send / all）"
+        description: "執行模式（all=立即抓取並發送 / fetch=只抓取 / send=只發送）"
         required: false
         default: "all"
 
@@ -29,8 +29,8 @@ jobs:
       - name: 📦 安裝套件
         run: pip install -r requirements.txt
 
-      # ── Step 1：9:50 抓取資料並生成 complete_report ──
-      - name: 📡 9:50 抓取 Telegram 訊息並生成報告
+      # ── Step 1：9:50 執行 auto_telegram_daily.py（抓取 + 格式化）──
+      - name: 📡 9:50 執行 auto_telegram_daily.py 抓取並生成 complete_report
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
@@ -39,16 +39,16 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python main.py fetch
 
-      # ── Step 2：等待至 10:00（約 10 分鐘）──
+      # ── Step 2：等待至 10:00（排程時才等待，手動觸發跳過）──
       - name: ⏳ 等待至 10:00 AM 台灣時間
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          echo "目前時間（UTC）: $(date -u)"
-          echo "等待 600 秒（10 分鐘）至 10:00 AM 台灣時間..."
+          echo "抓取完成時間（UTC）: $(date -u)"
+          echo "等待 600 秒（10 分鐘）..."
           sleep 600
           echo "發送時間（UTC）: $(date -u)"
 
-      # ── Step 3：10:00 發送 complete_report ──
+      # ── Step 3：10:00 傳送 complete_report 至 Telegram Bot ──
       - name: 📤 10:00 傳送 complete_report 至 Telegram Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -56,7 +56,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python main.py send
 
-      # ── 上傳報告備份 ──
+      # ── 備份報告 ──
       - name: 📦 上傳每日報告（Artifact，保留 30 天）
         if: always()
         uses: actions/upload-artifact@v4

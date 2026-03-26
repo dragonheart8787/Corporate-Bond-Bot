@@ -98,33 +98,48 @@ async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash:
     from telethon import TelegramClient
     from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
-    # session 名稱（保存在當前目錄）
-    session_name = 'test_session'  # 使用已登入的 session
+    # ── 優先使用環境變數中的 StringSession（GitHub Actions 使用）──
+    session_string = os.environ.get('TELEGRAM_SESSION_STRING', '').strip()
+    env_api_id = os.environ.get('TELEGRAM_API_ID', '').strip()
+    env_api_hash = os.environ.get('TELEGRAM_API_HASH', '').strip()
 
-    # 若未提供，互動輸入（首次）
-    if api_id is None or api_hash is None:
-        safe_print('首次使用需要 Telegram API 憑證，可在 https://my.telegram.org 取得')
-        api_id = int(input('請輸入 api_id: ').strip())
-        api_hash = input('請輸入 api_hash: ').strip()
-    if not phone or phone == "+8869xxxxxxxx":
-        phone = input('請輸入電話號碼（含國碼，如 +8869...）: ').strip()
+    if env_api_id:
+        api_id = int(env_api_id)
+    if env_api_hash:
+        api_hash = env_api_hash
 
-    # 保存以便下次免輸入
-    try:
-        save_config(api_id, api_hash, phone)
-    except Exception:
-        pass
+    if session_string:
+        # 使用 StringSession（免互動登入）
+        from telethon.sessions import StringSession
+        safe_print('ℹ️ 使用 StringSession（GitHub Actions 模式）')
+        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        await client.connect()
+    else:
+        # 本機模式：使用 session 檔案
+        session_name = 'test_session'
 
-    client = TelegramClient(session_name, api_id, api_hash)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.send_code_request(phone)
-        code = input('請輸入 Telegram 驗證碼: ').strip()
+        if api_id is None or api_hash is None:
+            safe_print('首次使用需要 Telegram API 憑證，可在 https://my.telegram.org 取得')
+            api_id = int(input('請輸入 api_id: ').strip())
+            api_hash = input('請輸入 api_hash: ').strip()
+        if not phone or phone == "+8869xxxxxxxx":
+            phone = input('請輸入電話號碼（含國碼，如 +8869...）: ').strip()
+
         try:
-            await client.sign_in(phone=phone, code=code)
-        except SessionPasswordNeededError:
-            pw = input('啟用兩步驗證，請輸入密碼: ').strip()
-            await client.sign_in(password=pw)
+            save_config(api_id, api_hash, phone)
+        except Exception:
+            pass
+
+        client = TelegramClient(session_name, api_id, api_hash)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.send_code_request(phone)
+            code = input('請輸入 Telegram 驗證碼: ').strip()
+            try:
+                await client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                pw = input('啟用兩步驗證，請輸入密碼: ').strip()
+                await client.sign_in(password=pw)
 
     # 尋找聊天
     try:
