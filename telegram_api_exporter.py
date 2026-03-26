@@ -114,6 +114,10 @@ async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash:
         safe_print('ℹ️ 使用 StringSession（GitHub Actions 模式）')
         client = TelegramClient(StringSession(session_string), api_id, api_hash)
         await client.connect()
+        # StringSession 沒有本機快取，必須先載入對話清單才能用名稱找到頻道
+        safe_print('📋 載入對話清單（首次連線必要）...')
+        await client.get_dialogs()
+        safe_print('✅ 對話清單載入完成')
     else:
         # 本機模式：使用 session 檔案
         session_name = 'test_session'
