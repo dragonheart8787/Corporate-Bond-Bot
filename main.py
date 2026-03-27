@@ -29,13 +29,20 @@ def today_str() -> str:
 
 
 def report_path() -> str:
-    """找今日報告；若不存在則找最近一份（應對時區邊界情況）"""
+    """
+    依優先順序找報告：
+    1. 今日 outputs/daily/complete_report_{today}.txt（當次 fetch 產生）
+    2. outputs/daily/ 下最新的任何 complete_report（時區邊界保底）
+    3. reports/complete_report_latest.txt（已 commit 到 repo，永遠存在）
+    """
     import glob
+
+    # 1. 今日報告（最理想）
     exact = os.path.join("outputs", "daily", f"complete_report_{today_str()}.txt")
     if os.path.exists(exact):
         return exact
 
-    # 保底：找 outputs/daily/ 下最新的 complete_report_*.txt
+    # 2. outputs/daily/ 最新一份
     candidates = sorted(
         glob.glob(os.path.join("outputs", "daily", "complete_report_*.txt")),
         key=os.path.getmtime,
@@ -45,7 +52,13 @@ def report_path() -> str:
         safe_print(f"ℹ️  今日報告不存在，改用最新：{os.path.basename(candidates[0])}")
         return candidates[0]
 
-    return exact   # 讓後續邏輯顯示正確的找不到錯誤訊息
+    # 3. repo 內已 commit 的報告（fetch 失敗時的最終備案）
+    repo_report = os.path.join("reports", "complete_report_latest.txt")
+    if os.path.exists(repo_report):
+        safe_print("ℹ️  使用 reports/complete_report_latest.txt（repo 備份）")
+        return repo_report
+
+    return exact   # 讓後續邏輯顯示正確的「找不到」錯誤
 
 
 # ─────────────────────────────────────────
