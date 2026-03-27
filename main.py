@@ -29,7 +29,23 @@ def today_str() -> str:
 
 
 def report_path() -> str:
-    return os.path.join("outputs", "daily", f"complete_report_{today_str()}.txt")
+    """找今日報告；若不存在則找最近一份（應對時區邊界情況）"""
+    import glob
+    exact = os.path.join("outputs", "daily", f"complete_report_{today_str()}.txt")
+    if os.path.exists(exact):
+        return exact
+
+    # 保底：找 outputs/daily/ 下最新的 complete_report_*.txt
+    candidates = sorted(
+        glob.glob(os.path.join("outputs", "daily", "complete_report_*.txt")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if candidates:
+        safe_print(f"ℹ️  今日報告不存在，改用最新：{os.path.basename(candidates[0])}")
+        return candidates[0]
+
+    return exact   # 讓後續邏輯顯示正確的找不到錯誤訊息
 
 
 # ─────────────────────────────────────────

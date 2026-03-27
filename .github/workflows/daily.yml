@@ -40,6 +40,7 @@ jobs:
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
           PYTHONIOENCODING: utf-8
+          TZ: Asia/Taipei       # 讓所有子程式都使用台灣時間產生檔名
         run: python main.py fetch
 
       # ── Step 2：將報告存到 reports/ 供 Bot 讀取 ──
@@ -77,6 +78,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONIOENCODING: utf-8
+          TZ: Asia/Taipei
         run: python main.py send
 
       # ── 備份 Artifact ──
