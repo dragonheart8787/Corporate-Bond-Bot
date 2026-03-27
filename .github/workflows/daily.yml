@@ -2,8 +2,8 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 23:40 台灣時間（UTC+8）= UTC 15:40，週一至週五
-    - cron: "40 15 * * 1-5"
+    # 23:40 台灣時間（UTC+8）= UTC 15:40，每天（含六日）
+    - cron: "40 15 * * *"
   workflow_dispatch:
     inputs:
       mode:
