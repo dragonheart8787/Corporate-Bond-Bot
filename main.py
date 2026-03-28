@@ -228,6 +228,14 @@ def filter_cb_only(full_report: str) -> str:
 
 
 # ─────────────────────────────────────────
+# 判斷過濾結果是否為「無公告」
+# ─────────────────────────────────────────
+def _is_empty_result(content: str) -> bool:
+    """回傳 True 表示過濾後無轉換公司債公告"""
+    return "今日無轉換公司債" in content or "無轉換公司債相關公告" in content
+
+
+# ─────────────────────────────────────────
 # MODE: send — 讀取 complete_report 並傳送
 # ─────────────────────────────────────────
 def mode_send() -> None:
@@ -258,6 +266,27 @@ def mode_send() -> None:
 
     # ── 只保留轉換公司債段落 ──
     content = filter_cb_only(full_content)
+
+    # ── 若第一次未抓到資料，等待 60 秒後重新 fetch 一次再確認 ──
+    if _is_empty_result(content):
+        safe_print("⚠️ 第一次過濾結果為無公告，60 秒後重新抓取確認...")
+        import time
+        time.sleep(60)
+        safe_print("🔄 重新執行 fetch ...")
+        mode_fetch()
+        # 重新讀取報告
+        path = report_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                full_content = f.read()
+            content = filter_cb_only(full_content)
+            if _is_empty_result(content):
+                safe_print("ℹ️ 重試後仍無轉換公司債公告，確認發送無公告訊息")
+            else:
+                safe_print("✅ 重試後有找到轉換公司債公告")
+        else:
+            safe_print("⚠️ 重試後仍找不到報告，沿用無公告訊息")
+
     safe_print(f"📄 報告路徑：{path}（原始 {len(full_content):,} 字元 → 過濾後 {len(content):,} 字元）")
     safe_print("▶ 傳送至 Telegram Bot ...")
 
