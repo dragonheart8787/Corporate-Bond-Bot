@@ -31,10 +31,20 @@ jobs:
   fetch-and-send:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # 避免每 15 分鐘多個 job 同時搶 Telegram / 同時 push；排隊執行較穩
+    concurrency:
+      group: corporate-bond-daily-${{ github.ref }}
+      cancel-in-progress: false
 
     steps:
       - name: 📥 Checkout 程式碼
         uses: actions/checkout@v4
+
+      - name: 🔎 觸發來源與時間（除錯用）
+        run: |
+          echo "github.event_name=${{ github.event_name }}"
+          echo "UTC=$(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "TW =$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
       - name: 🐍 設定 Python 3.11
         uses: actions/setup-python@v5
@@ -95,11 +105,27 @@ jobs:
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         run: sleep 5
 
+      - name: 🔍 發送前檢查報告檔
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        run: |
+          ls -la reports/ 2>/dev/null || echo "（無 reports 目錄）"
+          ls -la outputs/daily/ 2>/dev/null || echo "（無 outputs/daily）"
+          if [ -f reports/complete_report_latest.txt ]; then
+            echo "✅ reports/complete_report_latest.txt 存在，約 $(wc -c < reports/complete_report_latest.txt) bytes"
+          else
+            echo "::warning::缺少 reports/complete_report_latest.txt，send 將依 main.py 備援路徑找檔"
+          fi
+
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # send 內若觸發「無公告重試」會再跑 mode_fetch，需與 fetch 步驟相同憑證
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
+          TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
         run: |
           echo "即將執行：python main.py send（台灣時間 $(date '+%H:%M:%S')）"
           python main.py send
@@ -111,3 +137,4 @@ jobs:
           name: daily-reports-${{ github.run_number }}
           path: outputs/daily/
           retention-days: 30
+          if-no-files-found: ignore
