@@ -192,7 +192,7 @@ def main() -> None:
                     send_message(bot_token, chat_id, report)
                 else:
                     send_message(bot_token, chat_id,
-                        "❌ 找不到報告。\n請等待今日自動抓取完成（23:30 台灣時間）。")
+                        "❌ 找不到報告。\n請等待每日 workflow 完成（約 23:00～23:10 台灣時間）。")
 
             elif cmd == "/cb":
                 send_message(bot_token, chat_id, "⏳ 讀取轉換公司債公告中...")
@@ -212,8 +212,8 @@ def main() -> None:
                     f"🕐 現在時間：{now_tw}\n"
                     f"⏱  已運行：{uptime} 分鐘\n"
                     f"📊 報告更新：{updated}\n"
-                    f"📡 每日抓取：23:20\n"
-                    f"📤 每日傳送：23:30"
+                    f"📡 每日抓取：約 23:00\n"
+                    f"📤 每日傳送：約 23:05"
                 )
 
             elif cmd in ("/help", "/start"):
@@ -224,7 +224,7 @@ def main() -> None:
                     "/all    → 今日完整報告（所有公告）\n"
                     "/status → Bot 狀態與報告更新時間\n"
                     "/help   → 顯示此說明\n\n"
-                    "📅 每日自動傳送：晚上 23:30（台灣時間）"
+                    "📅 每日自動傳送：約 23:05（台灣時間）"
                 )
 
     safe_print("⏹️  Bot 運行時間到，正常退出（GitHub Actions 將自動重新啟動）")

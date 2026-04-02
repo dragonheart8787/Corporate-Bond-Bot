@@ -11,6 +11,9 @@ import os
 import sys
 import subprocess
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_TW = ZoneInfo("Asia/Taipei")
 
 
 def safe_print(msg: str):
@@ -68,14 +71,14 @@ def main():
     safe_print("\n" + "="*60)
     safe_print("🚀 自動化 Telegram 每日訊息分析系統")
     safe_print("="*60)
-    safe_print(f"📅 日期：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    safe_print(f"📅 日期：{datetime.now(_TW).strftime('%Y-%m-%d %H:%M:%S')}")
     safe_print("="*60)
     
     # 確保輸出目錄存在
     ensure_dir('outputs/daily')
     ensure_dir('outputs/daily/logs')
     
-    today_str = datetime.now().strftime('%Y%m%d')
+    today_str = datetime.now(_TW).strftime('%Y%m%d')
     
     # 步驟 1：抓取 Telegram 訊息（只抓今日）
     step1_success = run_step(

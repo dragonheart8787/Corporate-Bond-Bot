@@ -31,7 +31,8 @@ jobs:
       - name: 🤖 啟動 Telegram Bot 監聽（最多 5 小時）
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 勿用 secrets.GITHUB_TOKEN（未設定會變空字串，覆寫掉 Runner 內建 token，導致讀不到報告）
+          GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PYTHONIOENCODING: utf-8
         run: python bot_listener.py

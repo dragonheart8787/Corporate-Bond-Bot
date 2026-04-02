@@ -9,7 +9,10 @@ import os
 import csv
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
+
+_TW = ZoneInfo("Asia/Taipei")
 
 def safe_print(msg: str):
     """安全輸出，避免編碼錯誤"""
@@ -244,7 +247,7 @@ class CompleteFormatter:
         result = []
         result.append("📊 Telegram 公開資訊觀測站 - 完整格式化報告")
         result.append("=" * 60)
-        result.append(f"📅 生成時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        result.append(f"📅 生成時間：{datetime.now(_TW).strftime('%Y-%m-%d %H:%M:%S')}")
         result.append(f"📈 總計公告數：{len(rows)}")
         result.append(f"🔥 轉換公司債相關：{len(convertible_bond_announcements)} 則")
         result.append(f"📋 其他公告：{len(other_announcements)} 則")
@@ -315,7 +318,7 @@ class CompleteFormatter:
         result = []
         result.append("🔥 轉換公司債相關公告摘要")
         result.append("=" * 50)
-        result.append(f"📅 日期：{datetime.now().strftime('%Y-%m-%d')}")
+        result.append(f"📅 日期：{datetime.now(_TW).strftime('%Y-%m-%d')}")
         result.append(f"📈 轉換公司債公告數：{len(convertible_bond_announcements)}")
         result.append("")
         
@@ -349,7 +352,7 @@ def main():
     formatter = CompleteFormatter()
     
     # 讀取今日的 Telegram 資料
-    today = datetime.now().strftime('%Y%m%d')
+    today = datetime.now(_TW).strftime('%Y%m%d')
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):
@@ -410,7 +413,7 @@ def main():
     with open(insights_path, 'w', encoding='utf-8') as f:
         f.write("🏢 公司情況研判彙總\n")
         f.write("=" * 50 + "\n")
-        f.write(f"📅 日期：{datetime.now().strftime('%Y-%m-%d')}\n\n")
+        f.write(f"📅 日期：{datetime.now(_TW).strftime('%Y-%m-%d')}\n\n")
         if not insights_by_company:
             f.write("(今日無可研判之公司情況)\n")
         else:

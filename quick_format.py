@@ -10,6 +10,9 @@ import glob
 import csv
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_TW = ZoneInfo("Asia/Taipei")
 
 def safe_print(msg: str):
     """安全輸出，避免編碼錯誤"""
@@ -23,7 +26,7 @@ def main():
     safe_print("📝 快速格式化 Telegram 公告")
     safe_print("=" * 50)
     
-    today = datetime.now().strftime('%Y%m%d')
+    today = datetime.now(_TW).strftime('%Y%m%d')
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):
@@ -128,7 +131,7 @@ def main():
         f.write("📊 Telegram 公開資訊觀測站 - 美觀格式化報告\n")
         f.write("=" * 60 + "\n")
         f.write(f"📅 日期：{today}\n")
-        f.write(f"🕐 生成時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"🕐 生成時間：{datetime.now(_TW).strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"📈 總計公告數：{len(rows_today)}\n")
         if cb_count == 0:
             f.write("(無轉換公司債消息)\n\n")

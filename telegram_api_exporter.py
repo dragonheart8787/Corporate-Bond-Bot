@@ -25,8 +25,23 @@ import csv
 import time
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import List, Dict
+
+# 與 MOPS／台股情境一致，「今日」與顯示時間一律用亞洲／台北
+_TW = ZoneInfo("Asia/Taipei")
+
+
+def _msg_date_to_tw_str(msg_date) -> str:
+    """Telethon 的 msg.date 為 UTC，轉成台北時間字串，供 --today-only 與後續 pipeline 一致。"""
+    if not msg_date:
+        return ""
+    if msg_date.tzinfo is None:
+        dt_utc = msg_date.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = msg_date.astimezone(timezone.utc)
+    return dt_utc.astimezone(_TW).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def safe_print(msg: str) -> None:
@@ -53,7 +68,7 @@ def extract_links(text: str) -> List[str]:
 
 def write_outputs(rows: List[Dict], out_dir: str) -> Dict[str, str]:
     ensure_dir(out_dir)
-    today = datetime.now().strftime('%Y%m%d')
+    today = datetime.now(_TW).strftime('%Y%m%d')
     csv_path = os.path.join(out_dir, f'telegram_messages_{today}.csv')
     txt_path = os.path.join(out_dir, f'telegram_messages_{today}.txt')
 
@@ -184,7 +199,7 @@ async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash:
                 except Exception:
                     sender = ''
                 rows.append({
-                    'date': msg.date.strftime('%Y-%m-%d %H:%M:%S') if msg.date else '',
+                    'date': _msg_date_to_tw_str(msg.date) if msg.date else '',
                     'from': sender,
                     'text': str(text).replace('\r', ' ').replace('\n', ' ').strip(),
                     'links': ' '.join(links)
@@ -228,8 +243,7 @@ async def main():
         
         # 若指定只保留今日訊息
         if args.today_only:
-            from datetime import datetime
-            today_str = datetime.now().strftime('%Y-%m-%d')
+            today_str = datetime.now(_TW).strftime('%Y-%m-%d')
             original_count = len(rows)
             rows = [r for r in rows if r.get('date', '').startswith(today_str)]
             safe_print(f'ℹ️ 今日訊息篩選：{original_count} → {len(rows)} 則')
