@@ -8,8 +8,11 @@ name: 每日公司債自動抓取與 Telegram 通知
 # 4) 開 Actions → 左欄點本 workflow → 若出現排程已停用（disabled），按 Enable。
 # 5) 倉庫長期無活動時 GitHub 會自動暫停 scheduled workflows；任意 push 或手動 Enable 可恢復。
 # 6) 排程以 UTC 為準；推送後請等下一個 UTC :00 / :15 / :30 / :45 之後數分鐘再看是否有 run。
-# 7) 備援：本 workflow 已支援 repository_dispatch（event_type=daily-run）。可建 Fine-grained token
-#    （Contents+Actions 讀寫）後，用外部 cron 每 15 分鐘 POST：
+# 7) 備援 A：repository_dispatch（event_type=daily-run）+ PAT POST dispatches（見下方 curl）。
+# 8) 備援 B（建議）：本機「工作排程器」每 15 分鐘執行
+#    scripts/Trigger-GitHubDailyWorkflow.ps1（需環境變數 GITHUB_PAT，觸發 workflow_dispatch）。
+# 9) 診斷：另見 workflow「Schedule smoke test」—若它也從無 Scheduled run，即帳號/repo 層級停用內建排程。
+#    curl … repository_dispatch 範例：
 #    curl -L -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer TOKEN" \
 #      https://api.github.com/repos/dragonheart8787/Corporate-Bond-Bot/dispatches \
 #      -d '{"event_type":"daily-run"}'
