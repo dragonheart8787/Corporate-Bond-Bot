@@ -8,9 +8,16 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "執行模式（all=立即抓取並發送 / fetch=只抓取 / send=只發送）"
-        required: false
-        default: "all"
+        description: |
+          all = 與排程相同（抓取→commit→發送）。
+          send = 只跑發送（用 repo 內 reports/，測試自動發送路徑不必等 22:35）。
+          fetch = 只抓取並 commit，不發 Telegram。
+        type: choice
+        options:
+          - all
+          - send
+          - fetch
+        default: all
 
 permissions:
   contents: write
@@ -41,6 +48,7 @@ jobs:
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
         id: fetch
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -52,6 +60,7 @@ jobs:
           python main.py fetch
 
       - name: 💾 儲存報告至 reports/
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           mkdir -p reports
           TODAY=$(date +%Y%m%d)
@@ -70,6 +79,7 @@ jobs:
           fi
 
       - name: 📝 Commit 報告到 GitHub
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -82,9 +92,11 @@ jobs:
           fi
 
       - name: ⏳ 發送前短暫緩衝
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         run: sleep 5
 
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
