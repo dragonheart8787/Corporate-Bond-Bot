@@ -22,7 +22,7 @@ env:
 jobs:
   fetch-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 45     # 改為 45 分鐘（fetch 5 min + sleep 10 min + send 3 min，留足緩衝）
+    timeout-minutes: 60     # 含對齊 22:35 之等待（最長約 35 分）+ fetch + 緩衝
 
     steps:
       - name: 📥 Checkout 程式碼
@@ -82,35 +82,35 @@ jobs:
             git push || echo "::warning::git push 失敗，仍繼續執行發送（本地 outputs 仍有報告）"
           fi
 
-      # ── Step 3：排程時盡量對齊台灣 22:05 再發送（已過 22:05 則幾乎不睡）──
-      # GitHub 排程常延遲數分鐘開跑；若前置步驟結束已晚於 22:05，不應再長睡。
-      - name: ⏳ 對齊 22:05 台灣時間後再傳送
+      # ── Step 3：排程時對齊台灣 22:35 再發送（已過 22:35 則不睡，立刻發）──
+      # 注意：勿用「超過 N 分鐘就不睡」的上限——從 22:00 跑完前置步驟到 22:35 正常就要睡約 30 分鐘。
+      - name: ⏳ 對齊 22:35 台灣時間後再傳送
         if: ${{ github.event_name == 'schedule' }}
         run: |
           export TZ=Asia/Taipei
           echo "等待前時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
           NOW=$(date +%s)
-          TARGET=$(date -d "$(date +%F) 22:05:00" +%s)
+          TARGET=$(date -d "$(date +%F) 22:35:00" +%s)
           if [ "$TARGET" -le "$NOW" ]; then
-            echo "已達或超過當日 22:05（台灣），略過等待"
+            echo "已達或超過當日 22:35（台灣），略過等待、直接發送"
           else
             SEC=$((TARGET - NOW))
-            # 異常長等待（>30 分）視為時鐘／排程異常，避免睡過頭
-            if [ "$SEC" -gt 1800 ]; then
-              echo "::warning::距離 22:05 仍超過 30 分鐘（${SEC}s），略過等待直接發送"
+            # 僅防極端錯誤（>24h），否則一律睡到 22:35
+            if [ "$SEC" -gt 86400 ]; then
+              echo "::warning::等待秒數異常（${SEC}s），略過 sleep"
             else
-              echo "將 sleep ${SEC} 秒至當日 22:05（台灣）"
+              echo "將 sleep ${SEC} 秒至當日 22:35（台灣）"
               sleep "$SEC"
             fi
           fi
-          echo "傳送時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "傳送步驟開始時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
 
       # 緩衝：給 Telegram / 檔案系統一點時間（手動與排程都執行）
       - name: ⏳ 發送前短暫緩衝
         run: sleep 5
 
-      # ── Step 4：22:05 傳送轉換公司債公告 ──
-      - name: 📤 22:05 傳送轉換公司債公告至 Telegram Bot
+      # ── Step 4：22:35 傳送轉換公司債公告（排程時上一步已對齊時刻）──
+      - name: 📤 22:35 傳送轉換公司債公告至 Telegram Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
