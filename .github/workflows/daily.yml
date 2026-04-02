@@ -2,15 +2,15 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 台灣 22:35 = UTC 14:35（GitHub cron 僅支援 UTC）
-    # 改為「此時開跑」一次完成抓取+發送，避免 22:00 開跑再 sleep 半小時（易失敗、log 上也不易看出）
-    - cron: "35 14 * * *"
+    # 每 15 分鐘（UTC 的 :00、:15、:30、:45）。GitHub cron 以 UTC 為準，與台灣時差 +8。
+    # 提醒：頻繁執行會多次發 Telegram、也可能頻繁 commit；測試完請改回每日一次。
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       mode:
         description: |
           all = 與排程相同（抓取→commit→發送）。
-          send = 只跑發送（用 repo 內 reports/，測試自動發送路徑不必等 22:35）。
+          send = 只跑發送（用 repo 內 reports/，測試自動發送路徑）。
           fetch = 只抓取並 commit，不發 Telegram。
         type: choice
         options:
