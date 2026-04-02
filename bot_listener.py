@@ -4,21 +4,32 @@
 Telegram Bot 指令監聽器（部署於 GitHub Actions）
 
 指令：
-  /cb     → 傳送今日轉換公司債公告
-  /all    → 傳送今日完整報告（所有公告）
+  /cb     → 先即時抓取（若已設定 API），再傳今日轉換公司債公告
+  /all    → 先即時抓取，再傳今日完整報告
   /status → 顯示 Bot 狀態與更新時間
   /help   → 顯示指令說明
 """
 
+import glob
 import os
 import sys
 import time
 import base64
 import requests
+import subprocess
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 TW = timezone(timedelta(hours=8))
-MAX_RUNTIME_SEC = 5 * 3600   # 每次 GitHub Actions Job 最多跑 5 小時
+TW_ZONE = ZoneInfo("Asia/Taipei")
+MAX_RUNTIME_SEC = 5 * 3600  # 每次 GitHub Actions Job 最多跑 5 小時
+
+# 開始抓取前停頓（讓使用者先看到「正在抓取」訊息）
+PRE_FETCH_DELAY_SEC = int(os.environ.get("BOT_PRE_FETCH_DELAY_SEC", "4"))
+# 抓取完成後停頓再讀檔／回傳（緩衝檔案寫入與 API）
+POST_FETCH_DELAY_SEC = int(os.environ.get("BOT_POST_FETCH_DELAY_SEC", "6"))
+# 無新訊息時避免狂打 getUpdates
+IDLE_SLEEP_SEC = 0.8
 
 
 def safe_print(msg: str) -> None:
@@ -26,6 +37,64 @@ def safe_print(msg: str) -> None:
         print(msg, flush=True)
     except UnicodeEncodeError:
         print(msg.encode("utf-8", "replace").decode("utf-8"), flush=True)
+
+
+def repo_root() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def can_run_fetch() -> bool:
+    sid = os.environ.get("TELEGRAM_SESSION_STRING", "").strip()
+    aid = os.environ.get("TELEGRAM_API_ID", "").strip()
+    h = os.environ.get("TELEGRAM_API_HASH", "").strip()
+    return bool(sid and aid and h)
+
+
+def run_fetch_subprocess() -> int:
+    """執行 main.py fetch，回傳 process returncode。"""
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    safe_print("▶ 執行 main.py fetch ...")
+    try:
+        r = subprocess.run(
+            [sys.executable, "main.py", "fetch"],
+            cwd=repo_root(),
+            env=env,
+            timeout=600,
+        )
+        safe_print(f"▶ fetch 結束，returncode={r.returncode}")
+        return int(r.returncode)
+    except subprocess.TimeoutExpired:
+        safe_print("❌ fetch 逾時")
+        return 124
+    except Exception as e:
+        safe_print(f"❌ fetch 例外：{e}")
+        return 1
+
+
+def read_local_complete_report() -> str | None:
+    """優先今日台北日期之 complete_report，否則取 outputs/daily 最新一份。"""
+    today = datetime.now(TW_ZONE).strftime("%Y%m%d")
+    exact = os.path.join("outputs", "daily", f"complete_report_{today}.txt")
+    if os.path.isfile(exact):
+        try:
+            with open(exact, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            pass
+    candidates = sorted(
+        glob.glob(os.path.join("outputs", "daily", "complete_report_*.txt")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if candidates:
+        try:
+            with open(candidates[0], "r", encoding="utf-8") as f:
+                safe_print(f"ℹ️ 使用本地最新報告：{os.path.basename(candidates[0])}")
+                return f.read()
+        except OSError:
+            pass
+    return None
 
 
 # ─────────────────────────────────────────
@@ -42,11 +111,11 @@ def get_report_from_github(github_token: str, repo: str) -> str | None:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.ok:
             content = base64.b64decode(resp.json()["content"]).decode("utf-8")
-            safe_print(f"✅ 讀取報告成功（{len(content):,} 字元）")
+            safe_print(f"✅ 讀取 GitHub 報告成功（{len(content):,} 字元）")
             return content
-        safe_print(f"⚠️ GitHub API 回應：{resp.status_code}")
+        safe_print(f"⚠️ GitHub API 回應：{resp.status_code} {resp.text[:200]}")
     except Exception as e:
-        safe_print(f"❌ 讀取報告失敗：{e}")
+        safe_print(f"❌ 讀取 GitHub 報告失敗：{e}")
     return None
 
 
@@ -66,6 +135,14 @@ def get_report_updated_time(github_token: str, repo: str) -> str:
     except Exception:
         pass
     return "未知"
+
+
+def load_report_text(github_token: str, repo: str) -> str | None:
+    """本地優先，失敗再用 GitHub。"""
+    local = read_local_complete_report()
+    if local:
+        return local
+    return get_report_from_github(github_token, repo)
 
 
 # ─────────────────────────────────────────
@@ -136,95 +213,169 @@ def send_message(token: str, chat_id: str, text: str) -> None:
         time.sleep(0.3)
 
 
-def get_updates(token: str, offset: int = 0) -> list:
+def get_updates(token: str, offset: int) -> list:
     try:
         resp = requests.get(
             f"https://api.telegram.org/bot{token}/getUpdates",
             params={"offset": offset, "timeout": 30},
             timeout=35,
         )
-        return resp.json().get("result", [])
-    except Exception:
+        data = resp.json()
+        if not data.get("ok"):
+            desc = data.get("description", data)
+            safe_print(f"⚠️ getUpdates 失敗：{desc}")
+            return []
+        return data.get("result", [])
+    except Exception as e:
+        safe_print(f"⚠️ getUpdates 例外：{e}")
         return []
+
+
+def parse_command(text: str) -> str:
+    """只取第一個詞並去掉 @bot，例如 '/all@x' '/cb  ' → /all /cb"""
+    parts = text.strip().split(maxsplit=1)
+    if not parts:
+        return ""
+    return parts[0].split("@")[0].lower()
+
+
+def handle_report_command(
+    bot_token: str,
+    chat_id: str,
+    github_token: str,
+    github_repo: str,
+    mode: str,
+) -> None:
+    """
+    mode: 'all' | 'cb'
+    流程：提示 → 停頓 →（可選）fetch → 停頓 → 讀報告 → 回覆
+    """
+    if mode == "all":
+        send_message(
+            bot_token,
+            chat_id,
+            "⏳ 準備抓取最新資料…\n"
+            f"（約 {PRE_FETCH_DELAY_SEC} 秒後開始連線 Telegram 頻道）",
+        )
+    else:
+        send_message(
+            bot_token,
+            chat_id,
+            "⏳ 準備更新轉換公司債公告…\n"
+            f"（約 {PRE_FETCH_DELAY_SEC} 秒後開始抓取）",
+        )
+
+    time.sleep(PRE_FETCH_DELAY_SEC)
+
+    if can_run_fetch():
+        send_message(bot_token, chat_id, "📡 正在抓取頻道訊息並產生報告，請稍候（約 1～5 分鐘）…")
+        rc = run_fetch_subprocess()
+        if rc != 0:
+            send_message(
+                bot_token,
+                chat_id,
+                "⚠️ 即時抓取未完全成功，將改讀 GitHub 上最近一次已存檔的報告。",
+            )
+    else:
+        send_message(
+            bot_token,
+            chat_id,
+            "ℹ️ 未設定 TELEGRAM_SESSION_STRING 等憑證，略過即時抓取，改讀 GitHub 上的報告。",
+        )
+
+    time.sleep(POST_FETCH_DELAY_SEC)
+
+    report = load_report_text(github_token, github_repo)
+    if report:
+        if mode == "all":
+            send_message(bot_token, chat_id, report)
+        else:
+            send_message(bot_token, chat_id, filter_cb_only(report))
+    else:
+        send_message(
+            bot_token,
+            chat_id,
+            "❌ 找不到報告（本地與 GitHub 皆無）。\n"
+            "請確認每日 workflow 已成功執行，或檢查 Repo 內 reports/complete_report_latest.txt。",
+        )
 
 
 # ─────────────────────────────────────────
 # 主程式
 # ─────────────────────────────────────────
 def main() -> None:
-    bot_token    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
-    github_repo  = os.environ.get("GITHUB_REPOSITORY", "dragonheart8787/Corporate-Bond-Bot")
+    github_repo = os.environ.get("GITHUB_REPOSITORY", "dragonheart8787/Corporate-Bond-Bot")
 
     if not bot_token:
         safe_print("❌ 缺少 TELEGRAM_BOT_TOKEN")
         sys.exit(1)
 
     start_time = time.time()
-    deadline   = start_time + MAX_RUNTIME_SEC
-    offset     = 0
+    deadline = start_time + MAX_RUNTIME_SEC
+    offset = 0
 
     now_str = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
     end_str = datetime.fromtimestamp(deadline, TW).strftime("%H:%M:%S")
     safe_print(f"🤖 Bot 啟動  {now_str} 台灣時間（運行至 {end_str}）")
+    safe_print(f"   即時抓取：{'開啟' if can_run_fetch() else '關閉（僅讀 GitHub）'}")
+    safe_print(f"   抓取前後停頓：{PRE_FETCH_DELAY_SEC}s / {POST_FETCH_DELAY_SEC}s")
 
     while time.time() < deadline:
         updates = get_updates(bot_token, offset)
 
+        if not updates:
+            time.sleep(IDLE_SLEEP_SEC)
+            continue
+
         for upd in updates:
             offset = upd["update_id"] + 1
-            msg     = upd.get("message") or upd.get("edited_message", {})
+            msg = upd.get("message") or upd.get("edited_message", {})
             if not msg:
                 continue
-            text    = (msg.get("text") or "").strip()
+            text = (msg.get("text") or "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
             if not text or not chat_id:
                 continue
 
-            # 只取指令部分（@botname 形式）
-            cmd = text.split("@")[0].lower()
-            safe_print(f"📨 [{chat_id}] {text}")
+            cmd = parse_command(text)
+            safe_print(f"📨 [{chat_id}] cmd={cmd!r} raw={text[:80]!r}")
 
             if cmd == "/all":
-                send_message(bot_token, chat_id, "⏳ 讀取完整報告中...")
-                report = get_report_from_github(github_token, github_repo)
-                if report:
-                    send_message(bot_token, chat_id, report)
-                else:
-                    send_message(bot_token, chat_id,
-                        "❌ 找不到報告。\n請等待每日 workflow 完成（約 22:00～22:10 台灣時間）。")
+                handle_report_command(bot_token, chat_id, github_token, github_repo, "all")
 
             elif cmd == "/cb":
-                send_message(bot_token, chat_id, "⏳ 讀取轉換公司債公告中...")
-                report = get_report_from_github(github_token, github_repo)
-                if report:
-                    send_message(bot_token, chat_id, filter_cb_only(report))
-                else:
-                    send_message(bot_token, chat_id, "❌ 找不到報告。")
+                handle_report_command(bot_token, chat_id, github_token, github_repo, "cb")
 
             elif cmd == "/status":
                 updated = get_report_updated_time(github_token, github_repo)
-                now_tw  = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
-                uptime  = int((time.time() - start_time) / 60)
-                send_message(bot_token, chat_id,
+                now_tw = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
+                uptime = int((time.time() - start_time) / 60)
+                send_message(
+                    bot_token,
+                    chat_id,
                     f"🤖 Bot 狀態\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"🕐 現在時間：{now_tw}\n"
                     f"⏱  已運行：{uptime} 分鐘\n"
                     f"📊 報告更新：{updated}\n"
-                    f"📡 每日抓取：約 22:00\n"
-                    f"📤 每日傳送：約 22:05"
+                    f"📡 即時抓取：{'已設定' if can_run_fetch() else '未設定（僅 GitHub）'}\n"
+                    f"📅 每日自動：約 22:00 抓、22:05 發",
                 )
 
             elif cmd in ("/help", "/start"):
-                send_message(bot_token, chat_id,
+                send_message(
+                    bot_token,
+                    chat_id,
                     "📋 指令說明\n"
                     "━━━━━━━━━━━━━━━\n"
-                    "/cb     → 今日轉換公司債公告\n"
-                    "/all    → 今日完整報告（所有公告）\n"
-                    "/status → Bot 狀態與報告更新時間\n"
+                    "/cb     → 先抓取再傳今日「轉換公司債」摘要\n"
+                    "/all    → 先抓取再傳今日完整報告\n"
+                    "/status → 狀態與報告更新時間\n"
                     "/help   → 顯示此說明\n\n"
-                    "📅 每日自動傳送：約 22:05（台灣時間）"
+                    "⏱ 下指令後會先提示，再停頓數秒後才連線抓取；完成後亦會短暫停頓再回傳。\n"
+                    "📅 每日自動傳送：約 22:05（台灣時間）",
                 )
 
     safe_print("⏹️  Bot 運行時間到，正常退出（GitHub Actions 將自動重新啟動）")
