@@ -2,8 +2,9 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 22:00 台灣時間（UTC+8）= UTC 14:00，每天（含六日）
-    - cron: "0 14 * * *"
+    # 台灣 22:35 = UTC 14:35（GitHub cron 僅支援 UTC）
+    # 改為「此時開跑」一次完成抓取+發送，避免 22:00 開跑再 sleep 半小時（易失敗、log 上也不易看出）
+    - cron: "35 14 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -22,7 +23,7 @@ env:
 jobs:
   fetch-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 60     # 含對齊 22:35 之等待（最長約 35 分）+ fetch + 緩衝
+    timeout-minutes: 45
 
     steps:
       - name: 📥 Checkout 程式碼
@@ -37,39 +38,37 @@ jobs:
       - name: 📦 安裝套件
         run: pip install -r requirements.txt
 
-      # ── Step 1：22:00 抓取 + 格式化 ──
-      - name: 📡 22:00 抓取並生成 complete_report
+      # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
+      - name: 📡 抓取並生成 complete_report
+        id: fetch
+        continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
         run: |
-          echo "台灣時間：$(date '+%Y-%m-%d %H:%M:%S')"
+          echo "台灣時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
           python main.py fetch
 
-      # ── Step 2：將報告存到 reports/ 供 Bot /all 指令讀取 ──
       - name: 💾 儲存報告至 reports/
         run: |
           mkdir -p reports
-          # 用台灣時間取日期（全域 TZ=Asia/Taipei 已設定）
           TODAY=$(date +%Y%m%d)
           REPORT="outputs/daily/complete_report_${TODAY}.txt"
           if [ -f "$REPORT" ]; then
             cp "$REPORT" "reports/complete_report_latest.txt"
             echo "✅ 已複製 ${REPORT} → reports/complete_report_latest.txt"
           else
-            # 找最新一份（保底）
             LATEST=$(ls -t outputs/daily/complete_report_*.txt 2>/dev/null | head -1)
             if [ -n "$LATEST" ]; then
               cp "$LATEST" "reports/complete_report_latest.txt"
               echo "ℹ️ 用最新報告：${LATEST}"
             else
-              echo "⚠️ 找不到任何報告"
+              echo "::warning::本次未產生新報告，維持 repo 內既有 reports/（若 send 仍可能用舊檔）"
             fi
           fi
 
-      # push 失敗時仍要發 Telegram（不少使用者因分支保護導致 push 失敗而整段沒發）
       - name: 📝 Commit 報告到 GitHub
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
@@ -79,44 +78,20 @@ jobs:
             echo "無變更，略過 commit"
           else
             git commit -m "update: 每日報告 $(date '+%Y-%m-%d')"
-            git push || echo "::warning::git push 失敗，仍繼續執行發送（本地 outputs 仍有報告）"
+            git push || echo "::warning::git push 失敗，仍繼續發送 Telegram"
           fi
 
-      # ── Step 3：排程時對齊台灣 22:35 再發送（已過 22:35 則不睡，立刻發）──
-      # 注意：勿用「超過 N 分鐘就不睡」的上限——從 22:00 跑完前置步驟到 22:35 正常就要睡約 30 分鐘。
-      - name: ⏳ 對齊 22:35 台灣時間後再傳送
-        if: ${{ github.event_name == 'schedule' }}
-        run: |
-          export TZ=Asia/Taipei
-          echo "等待前時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
-          NOW=$(date +%s)
-          TARGET=$(date -d "$(date +%F) 22:35:00" +%s)
-          if [ "$TARGET" -le "$NOW" ]; then
-            echo "已達或超過當日 22:35（台灣），略過等待、直接發送"
-          else
-            SEC=$((TARGET - NOW))
-            # 僅防極端錯誤（>24h），否則一律睡到 22:35
-            if [ "$SEC" -gt 86400 ]; then
-              echo "::warning::等待秒數異常（${SEC}s），略過 sleep"
-            else
-              echo "將 sleep ${SEC} 秒至當日 22:35（台灣）"
-              sleep "$SEC"
-            fi
-          fi
-          echo "傳送步驟開始時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
-
-      # 緩衝：給 Telegram / 檔案系統一點時間（手動與排程都執行）
       - name: ⏳ 發送前短暫緩衝
         run: sleep 5
 
-      # ── Step 4：22:35 傳送轉換公司債公告（排程時上一步已對齊時刻）──
-      - name: 📤 22:35 傳送轉換公司債公告至 Telegram Bot
+      - name: 📤 傳送轉換公司債公告至 Telegram Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py send
+        run: |
+          echo "即將執行：python main.py send（台灣時間 $(date '+%H:%M:%S')）"
+          python main.py send
 
-      # ── 備份 Artifact ──
       - name: 📦 上傳每日報告（保留 30 天）
         if: always()
         uses: actions/upload-artifact@v4

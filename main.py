@@ -141,6 +141,10 @@ def mode_fetch() -> None:
         safe_print(f"✅ complete_report 已就緒：{path}（{size:,} bytes）")
     else:
         safe_print(f"❌ 找不到 complete_report：{path}")
+        # GitHub Actions：仍讓 job 繼續，後續 send 可用 reports/complete_report_latest.txt
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            safe_print("ℹ️  GITHUB_ACTIONS：不結束 job，send 將嘗試 repo 內備份報告")
+            return
         sys.exit(1)
 
 
