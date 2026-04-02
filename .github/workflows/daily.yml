@@ -77,12 +77,22 @@ jobs:
           git diff --staged --quiet && echo "無變更，略過 commit" || \
             (git commit -m "update: 每日報告 $(date '+%Y-%m-%d')" && git push)
 
-      # ── Step 3：等待至 22:05（排程觸發才等待）──
-      - name: ⏳ 等待至 22:05 台灣時間
+      # ── Step 3：對齊台灣 22:05 再發送（排程專用；已過 22:05 則不睡）──
+      # 說明：cron 只在 UTC 觸發，0 14 = 台灣 22:00 整點起算；先前固定 sleep 300
+      #       會變成「commit 完成後再等 5 分鐘」，與牆上時鐘 22:05 常對不起來。
+      - name: ⏳ 對齊 22:05 台灣時間後再傳送
         if: ${{ github.event_name == 'schedule' }}
         run: |
           echo "等待前時間：$(date '+%Y-%m-%d %H:%M:%S')"
-          sleep 300
+          NOW=$(date +%s)
+          TARGET=$(date -d "$(date +%F) 22:05:00" +%s)
+          if [ "$TARGET" -le "$NOW" ]; then
+            echo "已達或超過當日 22:05，略過等待直接發送"
+          else
+            SEC=$((TARGET - NOW))
+            echo "將 sleep ${SEC} 秒至當日 22:05（台灣）"
+            sleep "$SEC"
+          fi
           echo "傳送時間：$(date '+%Y-%m-%d %H:%M:%S')"
 
       # ── Step 4：22:05 傳送轉換公司債公告 ──
