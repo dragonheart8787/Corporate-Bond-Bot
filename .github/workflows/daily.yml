@@ -1,5 +1,21 @@
 name: 每日公司債自動抓取與 Telegram 通知
 
+# -----------------------------------------------------------------------------
+# 若 Actions 列表裡「完全沒有 Scheduled」觸發（只有手動 Run）→ 幾乎一定是 GitHub 端未跑排程，請檢查：
+# 1) 本 workflow 檔在「預設分支」（本 repo：master）。
+# 2) Settings → Actions → General → Actions permissions 須允許執行 workflows。
+# 3) 同上頁 Workflow permissions 建議選「Read and write」（要 push reports）。
+# 4) 開 Actions → 左欄點本 workflow → 若出現排程已停用（disabled），按 Enable。
+# 5) 倉庫長期無活動時 GitHub 會自動暫停 scheduled workflows；任意 push 或手動 Enable 可恢復。
+# 6) 排程以 UTC 為準；推送後請等下一個 UTC :00 / :15 / :30 / :45 之後數分鐘再看是否有 run。
+# 7) 備援：本 workflow 已支援 repository_dispatch（event_type=daily-run）。可建 Fine-grained token
+#    （Contents+Actions 讀寫）後，用外部 cron 每 15 分鐘 POST：
+#    curl -L -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer TOKEN" \
+#      https://api.github.com/repos/dragonheart8787/Corporate-Bond-Bot/dispatches \
+#      -d '{"event_type":"daily-run"}'
+# 文件：https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule
+# -----------------------------------------------------------------------------
+
 on:
   schedule:
     # 每 15 分鐘（UTC 的 :00、:15、:30、:45）。GitHub cron 以 UTC 為準，與台灣時差 +8。
@@ -18,6 +34,9 @@ on:
           - send
           - fetch
         default: all
+  # 備援：若 Scheduled 在 GitHub 上始終不觸發，可用 Fine-grained PAT + 外部排程 POST dispatches
+  repository_dispatch:
+    types: [daily-run]
 
 permissions:
   contents: write
@@ -58,7 +77,7 @@ jobs:
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
         id: fetch
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -70,7 +89,7 @@ jobs:
           python main.py fetch
 
       - name: 💾 儲存報告至 reports/
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           mkdir -p reports
           TODAY=$(date +%Y%m%d)
@@ -89,7 +108,7 @@ jobs:
           fi
 
       - name: 📝 Commit 報告到 GitHub
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -102,11 +121,11 @@ jobs:
           fi
 
       - name: ⏳ 發送前短暫緩衝
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         run: sleep 5
 
       - name: 🔍 發送前檢查報告檔
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         run: |
           ls -la reports/ 2>/dev/null || echo "（無 reports 目錄）"
           ls -la outputs/daily/ 2>/dev/null || echo "（無 outputs/daily）"
@@ -117,7 +136,7 @@ jobs:
           fi
 
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
