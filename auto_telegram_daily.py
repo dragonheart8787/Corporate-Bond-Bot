@@ -10,6 +10,7 @@
 import os
 import sys
 import subprocess
+import csv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -79,31 +80,74 @@ def main():
     ensure_dir('outputs/daily/logs')
     
     today_str = datetime.now(_TW).strftime('%Y%m%d')
-    
-    # 步驟 1：抓取 Telegram 訊息（只抓今日）
+    py = sys.executable
+    # GitHub Secrets 與本機一致：與 daily.yml 的 TELEGRAM_CHAT_NAME 對齊
+    chat = (os.environ.get("TELEGRAM_CHAT_NAME") or "").strip()
+    if not chat:
+        chat = "📢 [非官方] 公開資訊觀測站 即時重大訊息"
+    safe_print(f"📌 頻道名稱（TELEGRAM_CHAT_NAME 或預設）：{chat}")
+
+    def _csv_data_row_count(path: str) -> int:
+        if not os.path.exists(path):
+            return 0
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                return max(0, sum(1 for _ in csv.DictReader(f)))
+        except Exception:
+            return 0
+
+    csv_path = f"outputs/daily/telegram_messages_{today_str}.csv"
+
+    page_size = int(os.environ.get("TELEGRAM_FETCH_PAGE_SIZE", "400"))
+    max_today = int(os.environ.get("TELEGRAM_FETCH_MAX_TOTAL", "25000"))
+    fallback_limit = int(os.environ.get("TELEGRAM_FETCH_FALLBACK_LIMIT", "8000"))
+
+    # 步驟 1a：分頁抓取台北「今日」直到跨日或達上限（僅抓最新 N 則會漏掉清晨大量公告）
     step1_success = run_step(
-        "抓取 Telegram 今日訊息",
-        ['python', 'telegram_api_exporter.py', 
-         '--chat', '📢 [非官方] 公開資訊觀測站 即時重大訊息',
-         '--limit', '500',
-         '--today-only'],
-        timeout=180
+        "抓取 Telegram 訊息（台北今日，分頁不漏）",
+        [
+            py,
+            "telegram_api_exporter.py",
+            "--chat",
+            chat,
+            "--paginate-today",
+            "--page-size",
+            str(page_size),
+            "--max-total-messages",
+            str(max_today),
+        ],
+        timeout=900,
     )
-    
+
     if not step1_success:
         safe_print("\n⚠️ 訊息抓取失敗，嘗試繼續...")
-    
-    # 檢查是否有今日 CSV
-    csv_path = f'outputs/daily/telegram_messages_{today_str}.csv'
+
+    nrows = _csv_data_row_count(csv_path)
+    safe_print(f"ℹ️  exporter 今日篩選後列數：{nrows}")
+
+    # 今日 0 筆或未取得檔案時改抓「不篩日期」，供後續 quick_format / complete_formatter 有資料
+    if nrows <= 0:
+        if os.path.exists(csv_path):
+            safe_print("⚠️ 今日篩選後無資料，改抓取最近訊息（不限日期）…")
+        else:
+            safe_print("⚠️ 未取得訊息檔，改抓取最近訊息（不限日期）…")
+        run_step(
+            "抓取 Telegram 最近訊息（不限日期）",
+            [py, "telegram_api_exporter.py", "--chat", chat, "--limit", str(fallback_limit)],
+            timeout=600,
+        )
+        nrows = _csv_data_row_count(csv_path)
+        safe_print(f"ℹ️  不限日期抓取後列數：{nrows}")
+
     if not os.path.exists(csv_path):
-        safe_print(f"\n❌ 找不到今日訊息檔：{csv_path}")
-        safe_print("請確認 telegram_api_exporter.py 是否正常執行")
+        safe_print(f"\n❌ 找不到訊息檔：{csv_path}")
+        safe_print("請確認 TELEGRAM_* Secrets、TELEGRAM_CHAT_NAME 與 telegram_api_exporter.py")
         return
     
     # 步驟 2：格式化與分類（只處理今日訊息）
     step2_success = run_step(
         "格式化與分類今日公告",
-        ['python', 'quick_format.py'],
+        [py, "quick_format.py"],
         timeout=120
     )
     
@@ -114,7 +158,7 @@ def main():
     # 步驟 3：生成完整分析報告（含轉換公司債優先）
     step3_success = run_step(
         "生成完整分析報告",
-        ['python', 'complete_formatter.py'],
+        [py, "complete_formatter.py"],
         timeout=120
     )
     

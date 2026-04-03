@@ -83,7 +83,22 @@ def main():
         unique_today.append(r)
     rows_today = unique_today
     safe_print(f"✅ 今日公告數：{len(rows_today)}")
-    
+
+    # CI / 除錯：台北「今日」無筆但 CSV 內仍有其他日期資料時，改用最新若干則（頻道仍活躍卻對不到今日）
+    fb = os.environ.get("TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY", "").strip().lower()
+    try:
+        fb_max = int(os.environ.get("TELEGRAM_FALLBACK_RECENT_MAX", "2000"))
+    except ValueError:
+        fb_max = 2000
+    fb_max = max(100, min(fb_max, 20000))
+    if not rows_today and rows and fb in ("1", "true", "yes", "on"):
+        dated = [r for r in rows if (r.get("date") or "").strip()]
+        dated.sort(key=lambda x: x.get("date", ""), reverse=True)
+        rows_today = dated[:fb_max]
+        safe_print(
+            f"⚠️ 今日（台北）無符合列；改採 CSV 內最新 {len(rows_today)} 則（上限 {fb_max}，TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY）"
+        )
+
     # 生成美觀的格式化報告
     output_dir = 'outputs/daily'
     os.makedirs(output_dir, exist_ok=True)

@@ -44,6 +44,89 @@ def _msg_date_to_tw_str(msg_date) -> str:
     return dt_utc.astimezone(_TW).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _msg_date_to_tw_datetime(msg_date):
+    """msg.date → 台北 timezone-aware datetime（供分頁停止條件）。"""
+    if not msg_date:
+        return None
+    if msg_date.tzinfo is None:
+        dt_utc = msg_date.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = msg_date.astimezone(timezone.utc)
+    return dt_utc.astimezone(_TW)
+
+
+def _message_to_row(msg) -> Dict:
+    text = getattr(msg, "message", "") or ""
+    links = extract_links(text)
+    sender = ""
+    try:
+        if msg.sender:
+            if getattr(msg.sender, "username", None):
+                sender = f"@{msg.sender.username}"
+            elif getattr(msg.sender, "first_name", None) or getattr(msg.sender, "last_name", None):
+                sender = f"{getattr(msg.sender, 'first_name', '')} {getattr(msg.sender, 'last_name', '')}".strip()
+    except Exception:
+        sender = ""
+    return {
+        "date": _msg_date_to_tw_str(msg.date) if msg.date else "",
+        "from": sender,
+        "text": str(text).replace("\r", " ").replace("\n", " ").strip(),
+        "links": " ".join(links),
+    }
+
+
+async def _fetch_today_paginated(entity, client, page_size: int, max_total: int) -> List[Dict]:
+    """由最新訊息往舊分頁，直到本頁最舊一則已早於台北「今日」或達上限（避免只抓 N 則漏掉清晨公告）。"""
+    from telethon.errors import FloodWaitError
+
+    today_date = datetime.now(_TW).date()
+    rows: List[Dict] = []
+    offset_id = 0
+    backoff = 2.0
+    page_idx = 0
+
+    while len(rows) < max_total:
+        batch_msgs = []
+        while True:
+            try:
+                async for msg in client.iter_messages(entity, limit=page_size, offset_id=offset_id):
+                    batch_msgs.append(msg)
+                break
+            except FloodWaitError as fe:
+                wait = int(getattr(fe, "seconds", 5) or 5)
+                safe_print(f"⚠️ 頻率限制，等待 {wait} 秒後重試（分頁）...")
+                time.sleep(wait)
+            except Exception as e:
+                safe_print(f"⚠️ 分頁讀取錯誤：{e}，{backoff:.1f}s 後重試...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+        if not batch_msgs:
+            break
+
+        page_idx += 1
+        for msg in batch_msgs:
+            if not msg.date:
+                continue
+            dt_tw = _msg_date_to_tw_datetime(msg.date)
+            if dt_tw and dt_tw.date() == today_date:
+                rows.append(_message_to_row(msg))
+
+        oldest = batch_msgs[-1]
+        offset_id = oldest.id
+        oldest_tw = _msg_date_to_tw_datetime(oldest.date) if oldest.date else None
+
+        safe_print(
+            f"ℹ️ 分頁第 {page_idx} 頁：本頁 {len(batch_msgs)} 則，累計今日 {len(rows)} 則"
+        )
+
+        if oldest_tw and oldest_tw.date() < today_date:
+            break
+        backoff = 2.0
+
+    return rows
+
+
 def safe_print(msg: str) -> None:
     try:
         print(msg)
@@ -109,7 +192,17 @@ def save_config(api_id: int, api_hash: str, phone: str) -> None:
         json.dump({'api_id': api_id, 'api_hash': api_hash, 'phone': phone}, f, ensure_ascii=False, indent=2)
 
 
-async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash: str | None, phone: str | None) -> List[Dict]:
+async def connect_and_fetch(
+    chat: str,
+    limit: int,
+    api_id: int | None,
+    api_hash: str | None,
+    phone: str | None,
+    *,
+    paginate_today: bool = False,
+    page_size: int = 400,
+    max_total: int = 25000,
+) -> List[Dict]:
     from telethon import TelegramClient
     from telethon.errors import FloodWaitError, SessionPasswordNeededError
 
@@ -181,29 +274,20 @@ async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash:
         else:
             raise e
 
+    if paginate_today:
+        safe_print(f"ℹ️ 分頁抓取台北「今日」訊息（每頁 {page_size}，累計上限 {max_total}）")
+        rows = await _fetch_today_paginated(entity, client, page_size, max_total)
+        await client.disconnect()
+        rows.sort(key=lambda r: r["date"], reverse=True)
+        return rows
+
     rows: List[Dict] = []
     fetched = 0
     backoff = 2.0
     while fetched < limit:
         try:
             async for msg in client.iter_messages(entity, limit=limit, offset_id=0):
-                text = getattr(msg, 'message', '') or ''
-                links = extract_links(text)
-                sender = ''
-                try:
-                    if msg.sender:
-                        if getattr(msg.sender, 'username', None):
-                            sender = f"@{msg.sender.username}"
-                        elif getattr(msg.sender, 'first_name', None) or getattr(msg.sender, 'last_name', None):
-                            sender = f"{getattr(msg.sender, 'first_name', '')} {getattr(msg.sender, 'last_name', '')}".strip()
-                except Exception:
-                    sender = ''
-                rows.append({
-                    'date': _msg_date_to_tw_str(msg.date) if msg.date else '',
-                    'from': sender,
-                    'text': str(text).replace('\r', ' ').replace('\n', ' ').strip(),
-                    'links': ' '.join(links)
-                })
+                rows.append(_message_to_row(msg))
                 fetched += 1
                 if fetched >= limit:
                     break
@@ -226,8 +310,15 @@ async def connect_and_fetch(chat: str, limit: int, api_id: int | None, api_hash:
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--chat', required=True, help='聊天/群組/頻道名稱，例如：📢 [非官方] 公開資訊觀測站')
-    ap.add_argument('--limit', type=int, default=3000, help='最多抓取訊息數')
-    ap.add_argument('--today-only', action='store_true', help='只保留今日訊息')
+    ap.add_argument('--limit', type=int, default=3000, help='最多抓取訊息數（未使用 --paginate-today 時）')
+    ap.add_argument('--today-only', action='store_true', help='只保留今日訊息（未使用 --paginate-today 時；若只用 --limit 可能漏掉清晨公告）')
+    ap.add_argument(
+        '--paginate-today',
+        action='store_true',
+        help='分頁往舊抓取直到跨過台北「今日」或達上限，單日公告再多也盡量不漏',
+    )
+    ap.add_argument('--page-size', type=int, default=400, help='--paginate-today 每批則數')
+    ap.add_argument('--max-total-messages', type=int, default=25000, help='--paginate-today 今日累計上限')
     ap.add_argument('--api-id', type=int, default=None)
     ap.add_argument('--api-hash', default=None)
     ap.add_argument('--phone', default=None)
@@ -239,10 +330,18 @@ async def main():
     phone = args.phone if args.phone is not None else cfg.get('phone')
 
     try:
-        rows = await connect_and_fetch(args.chat, args.limit, api_id, api_hash, phone)
-        
-        # 若指定只保留今日訊息
-        if args.today_only:
+        rows = await connect_and_fetch(
+            args.chat,
+            args.limit,
+            api_id,
+            api_hash,
+            phone,
+            paginate_today=args.paginate_today,
+            page_size=args.page_size,
+            max_total=args.max_total_messages,
+        )
+
+        if args.today_only and not args.paginate_today:
             today_str = datetime.now(_TW).strftime('%Y-%m-%d')
             original_count = len(rows)
             rows = [r for r in rows if r.get('date', '').startswith(today_str)]

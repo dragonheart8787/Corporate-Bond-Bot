@@ -7,23 +7,17 @@ name: 每日公司債自動抓取與 Telegram 通知
 # 3) 同上頁 Workflow permissions 建議選「Read and write」（要 push reports）。
 # 4) 開 Actions → 左欄點本 workflow → 若出現排程已停用（disabled），按 Enable。
 # 5) 倉庫長期無活動時 GitHub 會自動暫停 scheduled workflows；任意 push 或手動 Enable 可恢復。
-# 6) 排程以 UTC 為準；推送後請等下一個 UTC :00 / :15 / :30 / :45 之後數分鐘再看是否有 run。
-# 7) 備援 A：repository_dispatch（event_type=daily-run）+ PAT POST dispatches（見下方 curl）。
-# 8) 備援 B（建議）：本機「工作排程器」每 15 分鐘執行
-#    scripts/Trigger-GitHubDailyWorkflow.ps1（需環境變數 GITHUB_PAT，觸發 workflow_dispatch）。
-# 9) 診斷：另見 workflow「Schedule smoke test」—若它也從無 Scheduled run，即帳號/repo 層級停用內建排程。
-#    curl … repository_dispatch 範例：
-#    curl -L -X POST -H "Accept: application/vnd.github+json" -H "Authorization: Bearer TOKEN" \
-#      https://api.github.com/repos/dragonheart8787/Corporate-Bond-Bot/dispatches \
-#      -d '{"event_type":"daily-run"}'
+# 6) 排程以 UTC 為準；本 workflow 為台北 22:00 → UTC 14:00，推送後請等該時段之後數分鐘再看是否有 run。
+# 7) 備援：若 GitHub 排程未跑，請用 PAT 觸發「workflow_dispatch」（scripts/Trigger-GitHubDailyWorkflow.ps1），
+#    勿再使用 repository_dispatch：過去若曾設定 n8n/cron/雲端 POST daily-run，會在任意時間觸發發送。
+# 8) 診斷：workflow「Schedule smoke test」可手動 Run 驗證 Actions；已關閉其 cron 以免混淆。
 # 文件：https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule
 # -----------------------------------------------------------------------------
 
 on:
   schedule:
-    # 每 15 分鐘（UTC 的 :00、:15、:30、:45）。GitHub cron 以 UTC 為準，與台灣時差 +8。
-    # 提醒：頻繁執行會多次發 Telegram、也可能頻繁 commit；測試完請改回每日一次。
-    - cron: "*/15 * * * *"
+    # 每日台北時間 22:00（UTC 14:00，cron 為 UTC）。與 env TZ: Asia/Taipei 一致。
+    - cron: "0 14 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -37,9 +31,6 @@ on:
           - send
           - fetch
         default: all
-  # 備援：若 Scheduled 在 GitHub 上始終不觸發，可用 Fine-grained PAT + 外部排程 POST dispatches
-  repository_dispatch:
-    types: [daily-run]
 
 permissions:
   contents: write
@@ -53,7 +44,7 @@ jobs:
   fetch-and-send:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # 避免每 15 分鐘多個 job 同時搶 Telegram / 同時 push；排隊執行較穩
+    # 每日一次仍保留佇列，避免與手動 workflow_dispatch 同時 push 衝突
     concurrency:
       group: corporate-bond-daily-${{ github.ref }}
       cancel-in-progress: false
@@ -62,11 +53,21 @@ jobs:
       - name: 📥 Checkout 程式碼
         uses: actions/checkout@v4
 
-      - name: 🔎 觸發來源與時間（除錯用）
+      - name: 🔎 觸發來源與時間（除錯「一直自動發送」必看）
         run: |
+          echo "========== WHO FIRED THIS RUN =========="
           echo "github.event_name=${{ github.event_name }}"
+          echo "github.actor=${{ github.actor }}"
+          echo "github.workflow=${{ github.workflow }}"
+          echo "run=${{ github.run_id }}  attempt=${{ github.run_attempt }}"
+          echo "url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "dispatch_mode=${{ github.event.inputs.mode }}"
           echo "UTC=$(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "TW =$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "TW=$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "=========================================="
+          echo "schedule = GitHub cron (this repo: daily 22:00 Taipei ~= UTC 14:00)"
+          echo "workflow_dispatch = manual Run, PAT script, or Windows Task Scheduler"
+          echo "If sends are every few minutes: check Task Scheduler + old n8n hitting workflow API."
 
       - name: 🐍 設定 Python 3.11
         uses: actions/setup-python@v5
@@ -80,19 +81,26 @@ jobs:
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
         id: fetch
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
+          # 今日 0 筆時仍用 CSV 內最新訊息產報告（避免 Bot 只發「無公告」其實是日期對不到）
+          TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY: "1"
+          TELEGRAM_FALLBACK_RECENT_MAX: "2000"
+          # 分頁抓今日：單日公告極多時可酌調大（注意 Actions 分鐘數與 Telegram 限流）
+          TELEGRAM_FETCH_PAGE_SIZE: "400"
+          TELEGRAM_FETCH_MAX_TOTAL: "25000"
+          TELEGRAM_FETCH_FALLBACK_LIMIT: "8000"
         run: |
           echo "台灣時間：$(date '+%Y-%m-%d %H:%M:%S %Z')"
           python main.py fetch
 
       - name: 💾 儲存報告至 reports/
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           mkdir -p reports
           TODAY=$(date +%Y%m%d)
@@ -110,25 +118,9 @@ jobs:
             fi
           fi
 
-      - name: 📝 Commit 報告到 GitHub
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add reports/
-          if git diff --staged --quiet; then
-            echo "無變更，略過 commit"
-          else
-            git commit -m "update: 每日報告 $(date '+%Y-%m-%d')"
-            git push || echo "::warning::git push 失敗，仍繼續發送 Telegram"
-          fi
-
-      - name: ⏳ 發送前短暫緩衝
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
-        run: sleep 5
-
+      # 先發送再 git push：避免 push 網路延遲／重試卡住 Telegram 10～20+ 分鐘（send 讀 runner 上檔案即可）
       - name: 🔍 發送前檢查報告檔
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         run: |
           ls -la reports/ 2>/dev/null || echo "（無 reports 目錄）"
           ls -la outputs/daily/ 2>/dev/null || echo "（無 outputs/daily）"
@@ -139,18 +131,38 @@ jobs:
           fi
 
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # send 內若觸發「無公告重試」會再跑 mode_fetch，需與 fetch 步驟相同憑證
+          # 僅在「只跑 send、未先 fetch」時可能需要；保留與 skip 搭配無妨
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
+          TELEGRAM_APPEND_ACTIONS_MARKER: "1"
+          # 僅在「本 job 已跑過 fetch」時略過 send 內二次 fetch；單獨 mode=send 時仍允許重試抓取
+          SKIP_SEND_REFETCH_ON_EMPTY: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           echo "即將執行：python main.py send（台灣時間 $(date '+%H:%M:%S')）"
           python main.py send
+          echo "### Telegram send 已執行" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 觸發: \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- run: ${{ github.run_id }} / attempt ${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 台灣時間: $(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 📝 Commit 報告到 GitHub
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add reports/
+          if git diff --staged --quiet; then
+            echo "無變更，略過 commit"
+          else
+            git commit -m "update: 每日報告 $(date '+%Y-%m-%d')"
+            git push || echo "::warning::git push 失敗（Telegram 已送出）"
+          fi
 
       - name: 📦 上傳每日報告（保留 30 天）
         if: always()

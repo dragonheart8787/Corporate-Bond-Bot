@@ -361,7 +361,7 @@ def main() -> None:
                     f"⏱  已運行：{uptime} 分鐘\n"
                     f"📊 報告更新：{updated}\n"
                     f"📡 即時抓取：{'已設定' if can_run_fetch() else '未設定（僅 GitHub）'}\n"
-                    f"📅 自動排程：約每 15 分鐘抓取並發送（GitHub 以 UTC 觸發）",
+                    f"📅 自動排程：每日台北 22:00 左右抓取並發送（GitHub cron UTC 14:00）",
                 )
 
             elif cmd in ("/help", "/start"):
@@ -375,7 +375,7 @@ def main() -> None:
                     "/status → 狀態與報告更新時間\n"
                     "/help   → 顯示此說明\n\n"
                     "⏱ 下指令後會先提示，再停頓數秒後才連線抓取；完成後亦會短暫停頓再回傳。\n"
-                    "📅 自動排程：約每 15 分鐘（GitHub UTC；實際可能晚 1～數分鐘）",
+                    "📅 自動排程：每日台北 22:00 左右（GitHub UTC 14:00；實際可能晚數分鐘）",
                 )
 
     safe_print("⏹️  Bot 運行時間到，正常退出（GitHub Actions 將自動重新啟動）")

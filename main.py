@@ -246,6 +246,12 @@ def mode_send() -> None:
     safe_print("\n" + "=" * 55)
     safe_print(f"📤 [SEND] {datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
     safe_print("=" * 55)
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        safe_print(
+            f"🔎 DEBUG: GITHUB_EVENT_NAME={os.environ.get('GITHUB_EVENT_NAME', '')!r} "
+            f"RUN_ID={os.environ.get('GITHUB_RUN_ID', '')!r} "
+            f"ACTOR={os.environ.get('GITHUB_ACTOR', '')!r}"
+        )
 
     bot_token, chat_id = load_bot_credentials()
 
@@ -271,14 +277,29 @@ def mode_send() -> None:
     # ── 只保留轉換公司債段落 ──
     content = filter_cb_only(full_content)
 
-    # ── 若第一次未抓到資料，等待 60 秒後重新 fetch 一次再確認 ──
-    if _is_empty_result(content):
-        safe_print("⚠️ 第一次過濾結果為無公告，60 秒後重新抓取確認...")
+    # ── 若第一次未抓到可轉債段落：本機可 sleep 後再 fetch；CI 同 job 已跑過 fetch 時應關閉避免重複分頁（省 1 分鐘～十多分鐘）──
+    skip_refetch = os.environ.get("SKIP_SEND_REFETCH_ON_EMPTY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if _is_empty_result(content) and skip_refetch:
+        safe_print(
+            "ℹ️  SKIP_SEND_REFETCH_ON_EMPTY：略過 send 內二次 fetch（與前一步 fetch 重複），直接發送目前過濾結果"
+        )
+    elif _is_empty_result(content):
         import time
-        time.sleep(60)
+
+        try:
+            wait_sec = int(os.environ.get("SEND_EMPTY_RETRY_SLEEP_SEC", "60"))
+        except ValueError:
+            wait_sec = 60
+        wait_sec = max(0, min(wait_sec, 300))
+        safe_print(f"⚠️ 第一次過濾結果為無公告，{wait_sec} 秒後重新抓取確認...")
+        time.sleep(wait_sec)
         safe_print("🔄 重新執行 fetch ...")
         mode_fetch()
-        # 重新讀取報告
         path = report_path()
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -292,6 +313,17 @@ def mode_send() -> None:
             safe_print("⚠️ 重試後仍找不到報告，沿用無公告訊息")
 
     safe_print(f"📄 報告路徑：{path}（原始 {len(full_content):,} 字元 → 過濾後 {len(content):,} 字元）")
+
+    # Actions 自動跑時附註 run 編號與觸發類型，方便對照「為何手動有、排程沒訊息」（其實是沒觸發或 job 失敗）
+    mark = os.environ.get("TELEGRAM_APPEND_ACTIONS_MARKER", "").strip().lower()
+    if mark in ("1", "true", "yes", "on") and os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        rn = os.environ.get("GITHUB_RUN_NUMBER", "")
+        ev = os.environ.get("GITHUB_EVENT_NAME", "")
+        rid = os.environ.get("GITHUB_RUN_ID", "")
+        if rn or rid:
+            tail = f"\n\n—— CI run #{rn}" + (f" ({ev})" if ev else "") + (f" id={rid}" if rid else "")
+            content = content.rstrip() + tail
+
     safe_print("▶ 傳送至 Telegram Bot ...")
 
     ok = send_telegram(bot_token, chat_id, content)

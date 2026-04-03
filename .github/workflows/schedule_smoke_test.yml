@@ -1,10 +1,8 @@
-# 極簡排程測試：若這個 workflow 也從未出現 Scheduled run，
-# 代表整個 repo 的 GitHub「內建 cron」未生效（帳號/組織/設定），請改用 scripts/Trigger-GitHubDailyWorkflow.ps1
+# 手動驗證 Actions 能否執行（不發 Telegram）。已關閉 cron，避免每 15 分鐘製造雜訊。
+# 若要測 GitHub「內建 schedule」是否生效，請暫時在下方加回 schedule 或看 daily workflow 的每日 run。
 name: Schedule smoke test
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
