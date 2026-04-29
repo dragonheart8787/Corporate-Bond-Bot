@@ -12,9 +12,11 @@
 import os
 import sys
 import subprocess
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-TW = timezone(timedelta(hours=8))
+# 與 quick_format / exporter 一致，避免「固定 UTC+8」與 IANA 時區在邊界日期不一致
+_TWZ = ZoneInfo("Asia/Taipei")
 
 
 def safe_print(msg: str) -> None:
@@ -25,7 +27,7 @@ def safe_print(msg: str) -> None:
 
 
 def today_str() -> str:
-    return datetime.now(TW).strftime("%Y%m%d")
+    return datetime.now(_TWZ).strftime("%Y%m%d")
 
 
 def report_path() -> str:
@@ -114,7 +116,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 # ─────────────────────────────────────────
 def mode_fetch() -> None:
     safe_print("\n" + "=" * 55)
-    safe_print(f"📥 [FETCH] {datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
+    safe_print(f"📥 [FETCH] {datetime.now(_TWZ).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
     safe_print("=" * 55)
 
     # 將 GitHub Secrets 傳入子行程環境變數
@@ -186,7 +188,7 @@ def filter_cb_only(full_report: str) -> str:
       ...
       📢 澄清媒體報導 (N 則)  ← 下一個非CB區段（用此作為結尾）
     """
-    date_str = datetime.now(TW).strftime("%Y-%m-%d")
+    date_str = datetime.now(_TWZ).strftime("%Y-%m-%d")
 
     # ── 找 CB 區段的開始位置 ──
     CB_SECTION_MARKERS = [
@@ -244,7 +246,7 @@ def _is_empty_result(content: str) -> bool:
 # ─────────────────────────────────────────
 def mode_send() -> None:
     safe_print("\n" + "=" * 55)
-    safe_print(f"📤 [SEND] {datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
+    safe_print(f"📤 [SEND] {datetime.now(_TWZ).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
     safe_print("=" * 55)
     if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
         safe_print(
