@@ -47,7 +47,7 @@ $data = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
 Write-Host ""
 Write-Host "Recent runs: $Owner/$Repo workflow daily.yml"
 Write-Host "If you see many workflow_dispatch close together -> PAT/Task Scheduler/n8n."
-Write-Host "schedule should appear ~once per day at UTC 14:xx."
+Write-Host "schedule should appear ~once per day at UTC 13:xx."
 Write-Host ("{0,-22} {1,-18} {2,-12} {3}" -f "created_at(UTC)", "event", "conclusion", "html_url")
 Write-Host ("-" * 120)
 foreach ($r in $data.workflow_runs) {

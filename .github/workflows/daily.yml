@@ -7,7 +7,7 @@ name: 每日公司債自動抓取與 Telegram 通知
 # 3) 同上頁 Workflow permissions 建議選「Read and write」（要 push reports）。
 # 4) 開 Actions → 左欄點本 workflow → 若出現排程已停用（disabled），按 Enable。
 # 5) 倉庫長期無活動時 GitHub 會自動暫停 scheduled workflows；任意 push 或手動 Enable 可恢復。
-# 6) 排程以 UTC 為準；本 workflow 為台北 22:00 → UTC 14:00，推送後請等該時段之後數分鐘再看是否有 run。
+# 6) 排程以 UTC 為準；本 workflow 為台北 21:00 → UTC 13:00，推送後請等該時段之後數分鐘再看是否有 run。
 # 7) 備援：若 GitHub 排程未跑，請用 PAT 觸發「workflow_dispatch」（scripts/Trigger-GitHubDailyWorkflow.ps1），
 #    勿再使用 repository_dispatch：過去若曾設定 n8n/cron/雲端 POST daily-run，會在任意時間觸發發送。
 # 8) 診斷：workflow「Schedule smoke test」可手動 Run 驗證 Actions；已關閉其 cron 以免混淆。
@@ -16,8 +16,8 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 每日台北時間 22:00（UTC 14:00，cron 為 UTC）。與 env TZ: Asia/Taipei 一致。
-    - cron: "0 14 * * *"
+    # 每日台北時間 21:00（UTC 13:00，cron 為 UTC）。與 env TZ: Asia/Taipei 一致。
+    - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -65,7 +65,7 @@ jobs:
           echo "UTC=$(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "TW=$(date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "=========================================="
-          echo "schedule = GitHub cron (this repo: daily 22:00 Taipei ~= UTC 14:00)"
+          echo "schedule = GitHub cron (this repo: daily 21:00 Taipei ~= UTC 13:00)"
           echo "workflow_dispatch = manual Run, PAT script, or Windows Task Scheduler"
           echo "If sends are every few minutes: check Task Scheduler + old n8n hitting workflow API."
 
