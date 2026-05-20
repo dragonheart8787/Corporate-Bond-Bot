@@ -88,8 +88,9 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
-          # 今日 0 筆時仍用 CSV 內最新訊息產報告（避免 Bot 只發「無公告」其實是日期對不到）
-          TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY: "1"
+          # 今日 0 筆時勿用舊 CSV 填報告（曾導致 4/30 公告被重發）；僅允許最多 1 日 fallback
+          TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY: "0"
+          TELEGRAM_FALLBACK_RECENT_DAYS: "1"
           TELEGRAM_FALLBACK_RECENT_MAX: "2000"
           # 分頁抓今日：單日公告極多時可酌調大（注意 Actions 分鐘數與 Telegram 限流）
           TELEGRAM_FETCH_PAGE_SIZE: "400"
@@ -109,13 +110,7 @@ jobs:
             cp "$REPORT" "reports/complete_report_latest.txt"
             echo "✅ 已複製 ${REPORT} → reports/complete_report_latest.txt"
           else
-            LATEST=$(ls -t outputs/daily/complete_report_*.txt 2>/dev/null | head -1)
-            if [ -n "$LATEST" ]; then
-              cp "$LATEST" "reports/complete_report_latest.txt"
-              echo "ℹ️ 用最新報告：${LATEST}"
-            else
-              echo "::warning::本次未產生新報告，維持 repo 內既有 reports/（若 send 仍可能用舊檔）"
-            fi
+            echo "::warning::未產生 outputs/daily/complete_report_${TODAY}.txt，不覆寫 reports/（避免把 4/30 等舊報告當最新送出）"
           fi
 
       # 先發送再 git push：避免 push 網路延遲／重試卡住 Telegram 10～20+ 分鐘（send 讀 runner 上檔案即可）

@@ -125,19 +125,29 @@ def main():
     nrows = _csv_data_row_count(csv_path)
     safe_print(f"ℹ️  exporter 今日篩選後列數：{nrows}")
 
-    # 今日 0 筆或未取得檔案時改抓「不篩日期」，供後續 quick_format / complete_formatter 有資料
+    # 今日 0 筆：僅再試「大量訊息 + 僅保留今日」，絕不寫入 4/30 等舊資料到今日 CSV
     if nrows <= 0:
         if os.path.exists(csv_path):
-            safe_print("⚠️ 今日篩選後無資料，改抓取最近訊息（不限日期）…")
+            safe_print("⚠️ 今日分頁抓取無資料，改試 --today-only（大 limit，仍只留今日）…")
         else:
-            safe_print("⚠️ 未取得訊息檔，改抓取最近訊息（不限日期）…")
+            safe_print("⚠️ 未取得訊息檔，改試 --today-only…")
         run_step(
-            "抓取 Telegram 最近訊息（不限日期）",
-            [py, "telegram_api_exporter.py", "--chat", chat, "--limit", str(fallback_limit)],
+            "抓取 Telegram（僅台北今日，大 limit）",
+            [
+                py,
+                "telegram_api_exporter.py",
+                "--chat",
+                chat,
+                "--limit",
+                str(fallback_limit),
+                "--today-only",
+            ],
             timeout=600,
         )
         nrows = _csv_data_row_count(csv_path)
-        safe_print(f"ℹ️  不限日期抓取後列數：{nrows}")
+        safe_print(f"ℹ️  --today-only 抓取後列數：{nrows}")
+        if nrows <= 0:
+            safe_print("ℹ️  台北今日仍無 Telegram 列；後續將產出「無公告」報告（不混入舊日期）")
 
     if not os.path.exists(csv_path):
         safe_print(f"\n❌ 找不到訊息檔：{csv_path}")

@@ -30,37 +30,41 @@ def today_str() -> str:
     return datetime.now(_TWZ).strftime("%Y%m%d")
 
 
+def _report_file_date_yyyymmdd(path: str) -> str | None:
+    """從 complete_report_YYYYMMDD.txt 檔名取出日期。"""
+    import re
+
+    m = re.search(r"complete_report_(\d{8})\.txt$", os.path.basename(path))
+    return m.group(1) if m else None
+
+
 def report_path() -> str:
     """
-    依優先順序找報告：
-    1. 今日 outputs/daily/complete_report_{today}.txt（當次 fetch 產生）
-    2. outputs/daily/ 下最新的任何 complete_report（時區邊界保底）
-    3. reports/complete_report_latest.txt（已 commit 到 repo，永遠存在）
+    依優先順序找報告（僅接受「檔名日期 = 台北今日」，避免送出 4/30 等舊報告）：
+    1. outputs/daily/complete_report_{today}.txt
+    2. reports/complete_report_latest.txt（僅當內文標頭日期為今日）
     """
-    import glob
-
-    # 1. 今日報告（最理想）
-    exact = os.path.join("outputs", "daily", f"complete_report_{today_str()}.txt")
+    today = today_str()
+    exact = os.path.join("outputs", "daily", f"complete_report_{today}.txt")
     if os.path.exists(exact):
         return exact
 
-    # 2. outputs/daily/ 最新一份
-    candidates = sorted(
-        glob.glob(os.path.join("outputs", "daily", "complete_report_*.txt")),
-        key=os.path.getmtime,
-        reverse=True,
-    )
-    if candidates:
-        safe_print(f"ℹ️  今日報告不存在，改用最新：{os.path.basename(candidates[0])}")
-        return candidates[0]
-
-    # 3. repo 內已 commit 的報告（fetch 失敗時的最終備案）
     repo_report = os.path.join("reports", "complete_report_latest.txt")
     if os.path.exists(repo_report):
-        safe_print("ℹ️  使用 reports/complete_report_latest.txt（repo 備份）")
-        return repo_report
+        today_dash = f"{today[:4]}-{today[4:6]}-{today[6:8]}"
+        try:
+            with open(repo_report, "r", encoding="utf-8") as f:
+                head = f.read(1200)
+            if today_dash in head or f"日期：{today}" in head or f"日期：{today_dash}" in head:
+                safe_print("ℹ️  使用 reports/complete_report_latest.txt（標頭為今日）")
+                return repo_report
+        except OSError:
+            pass
+        safe_print(
+            f"⚠️  略過 reports/complete_report_latest.txt（非今日 {today_dash}，避免重發舊公告）"
+        )
 
-    return exact   # 讓後續邏輯顯示正確的「找不到」錯誤
+    return exact
 
 
 # ─────────────────────────────────────────

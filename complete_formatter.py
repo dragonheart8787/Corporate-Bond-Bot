@@ -12,7 +12,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
 
-_TW = ZoneInfo("Asia/Taipei")
+from telegram_date_utils import (
+    TW,
+    dedupe_rows,
+    filter_rows_today,
+    today_yyyymmdd,
+)
+
+_TW = TW
 
 def safe_print(msg: str):
     """安全輸出，避免編碼錯誤"""
@@ -352,7 +359,7 @@ def main():
     formatter = CompleteFormatter()
     
     # 讀取今日的 Telegram 資料
-    today = datetime.now(_TW).strftime('%Y%m%d')
+    today = today_yyyymmdd()
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):
@@ -360,14 +367,18 @@ def main():
         safe_print("請先執行 telegram_api_exporter.py 抓取資料")
         return
     
-    # 讀取 CSV 資料
-    rows = []
+    # 讀取 CSV 資料（僅台北「今日」；檔名雖為今日，fallback 抓取可能混入 4/30 等舊列）
+    rows_raw = []
     with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append(row)
+            rows_raw.append(row)
     
-    safe_print(f"✅ 讀取到 {len(rows)} 則公告")
+    rows = dedupe_rows(filter_rows_today(rows_raw, today))
+    dropped = len(rows_raw) - len(rows)
+    safe_print(f"✅ CSV 共 {len(rows_raw)} 列，篩選台北今日後 {len(rows)} 則（排除 {dropped} 列舊日期）")
+    if dropped > 0:
+        safe_print("ℹ️ 若排除數很多，請檢查 auto_telegram_daily 是否曾用「不限日期」覆寫今日 CSV")
     
     # 檢查轉換公司債相關公告
     convertible_bond_count = sum(1 for row in rows if formatter.is_convertible_bond_related(row.get('text', '')))

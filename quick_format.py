@@ -10,27 +10,18 @@ import glob
 import csv
 import json
 import re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
-_TW = ZoneInfo("Asia/Taipei")
+from telegram_date_utils import (
+    TW,
+    dedupe_rows,
+    filter_rows_today,
+    filter_rows_within_days,
+    today_yyyymmdd,
+    yyyymmdd_from_csv_filename,
+)
 
-
-def _yyyymmdd_from_exporter_date_cell(value: str) -> str | None:
-    """與 telegram_api_exporter 寫入之 date 欄對齊：優先 YYYY-MM-DD。"""
-    if not value:
-        return None
-    v = value.strip()
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", v)
-    if m:
-        return f"{m.group(1)}{m.group(2)}{m.group(3)}"
-    m2 = re.match(r"^(\d{8})", v.replace("/", "-"))
-    return m2.group(1) if m2 else None
-
-
-def _csv_file_yyyymmdd(path: str) -> str | None:
-    m = re.search(r"telegram_messages_(\d{8})\.csv$", os.path.basename(path))
-    return m.group(1) if m else None
+_TW = TW
 
 def safe_print(msg: str):
     """安全輸出，避免編碼錯誤"""
@@ -44,7 +35,7 @@ def main():
     safe_print("📝 快速格式化 Telegram 公告")
     safe_print("=" * 50)
     
-    today = datetime.now(_TW).strftime('%Y%m%d')
+    today = today_yyyymmdd()
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):
@@ -63,7 +54,7 @@ def main():
     all_csvs = sorted(glob.glob('outputs/daily/telegram_messages_*.csv'), reverse=True)
     merge_all = os.environ.get("MERGE_ALL_TELEGRAM_CSV", "").strip().lower() in ("1", "true", "yes")
     if not merge_all:
-        day_only = [p for p in all_csvs if _csv_file_yyyymmdd(p) == today]
+        day_only = [p for p in all_csvs if yyyymmdd_from_csv_filename(p) == today]
         if day_only:
             all_csvs = day_only
             safe_print(f"ℹ️ 僅合併今日檔名之 CSV（{len(all_csvs)} 個）；若要合併全部歷史檔請設 MERGE_ALL_TELEGRAM_CSV=1")
@@ -92,23 +83,9 @@ def main():
     if used_csvs:
         safe_print(f"ℹ️ 已讀取 {len(used_csvs)} 個來源檔：{', '.join(used_csvs[:5])}{' ...' if len(used_csvs) > 5 else ''}")
     
-    # 僅保留「date 欄台北日期 = 今日」；改用完整 YYYYMMDD 相等，避免 startswith 誤判
-    def _is_today_date(value: str) -> bool:
-        d = _yyyymmdd_from_exporter_date_cell(value)
-        return d is not None and d == today
-
-    rows_today = [r for r in rows if _is_today_date(r.get('date', ''))]
-
-    # 去重（以日期+文字為鍵）
-    seen = set()
-    unique_today = []
-    for r in rows_today:
-        key = (r.get('date', ''), r.get('text', ''))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_today.append(r)
-    rows_today = unique_today
+    rows_today = dedupe_rows(filter_rows_today(rows, today))
+    if len(rows) > len(rows_today):
+        safe_print(f"ℹ️ 合併 {len(rows)} 列 → 台北今日 {len(rows_today)} 則（排除 {len(rows) - len(rows_today)} 列舊日期）")
     safe_print(f"✅ 今日公告數：{len(rows_today)}")
 
     # CI / 除錯：台北「今日」無筆但 CSV 內仍有其他日期資料時，改用最新若干則（頻道仍活躍卻對不到今日）
@@ -119,17 +96,17 @@ def main():
         fb_max = 2000
     fb_max = max(100, min(fb_max, 20000))
     if not rows_today and rows and fb in ("1", "true", "yes", "on"):
-        # 限制在「台北最近 7 日內」之列，避免一次撈到 3 月等過舊資料
-        cutoff = (datetime.now(_TW) - timedelta(days=7)).strftime("%Y%m%d")
-        dated = []
-        for r in rows:
-            d = _yyyymmdd_from_exporter_date_cell(r.get("date", ""))
-            if d and d >= cutoff:
-                dated.append(r)
+        try:
+            fb_days = int(os.environ.get("TELEGRAM_FALLBACK_RECENT_DAYS", "1"))
+        except ValueError:
+            fb_days = 1
+        fb_days = max(1, min(fb_days, 3))
+        dated = filter_rows_within_days(rows, fb_days, today)
         dated.sort(key=lambda x: x.get("date", ""), reverse=True)
         rows_today = dated[:fb_max]
         safe_print(
-            f"⚠️ 今日（台北）無符合列；改採最近 7 日內最新 {len(rows_today)} 則（上限 {fb_max}，TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY）"
+            f"⚠️ 今日（台北）無符合列；改採最近 {fb_days} 日內最新 {len(rows_today)} 則"
+            f"（上限 {fb_max}，TELEGRAM_FALLBACK_RECENT_WHEN_EMPTY_TODAY）"
         )
 
     # 生成美觀的格式化報告
