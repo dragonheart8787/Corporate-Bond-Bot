@@ -30,14 +30,6 @@ def today_str() -> str:
     return datetime.now(_TWZ).strftime("%Y%m%d")
 
 
-def _report_file_date_yyyymmdd(path: str) -> str | None:
-    """從 complete_report_YYYYMMDD.txt 檔名取出日期。"""
-    import re
-
-    m = re.search(r"complete_report_(\d{8})\.txt$", os.path.basename(path))
-    return m.group(1) if m else None
-
-
 def report_path() -> str:
     """
     依優先順序找報告（僅接受「檔名日期 = 台北今日」，避免送出 4/30 等舊報告）：
