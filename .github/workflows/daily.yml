@@ -17,7 +17,7 @@ name: 每日公司債自動抓取與 Telegram 通知
 on:
   schedule:
     # 每日台北時間 21:00（UTC 13:00，cron 為 UTC）。與 env TZ: Asia/Taipei 一致。
-    - cron: "0 12 * * *"
+    - cron: "0 11 * * *"
   workflow_dispatch:
     inputs:
       mode:
