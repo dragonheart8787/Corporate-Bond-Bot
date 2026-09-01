@@ -63,6 +63,36 @@ def filter_rows_within_days(rows: List[Dict[str, Any]], days: int, today: Option
     return out
 
 
+# ─────────────────────────────────────────
+# 公告欄位抽取（quick_format 與 complete_formatter 共用）
+#
+# 注意：舊版寫成 [^發佈]+ / [^說明]+ / [^發言人職稱]+，那是「否定字元集」
+# （不是某個單字），只要公司名或職稱含到其中任一個字就會被截斷或整條失效，
+# 例如「#1234 #佈佳公司」會被判成「未知公司」。改用欄位標籤 lookahead。
+# ─────────────────────────────────────────
+
+# 實際訊息格式：#8936 #國統 發佈時間：20260826 15:50:53 <標題> #可轉債
+# 公司名是一個 hashtag token，本身不含空白與 #
+COMPANY_RE = re.compile(r"#(\d+)\s*#([^\s#]+)")
+SPEAKER_RE = re.compile(r"發言人：\s*(.+?)(?=\s*發言人職稱：|\s*說明：|\s*$)")
+SPEAKER_TITLE_RE = re.compile(r"發言人職稱：\s*(.+?)(?=\s*說明：|\s*$)")
+PUBLISH_TIME_RE = re.compile(r"發佈時間：(\d{8}\s+\d{2}:\d{2}:\d{2})")
+
+
+def clean_company_name(raw: str) -> str:
+    """
+    公司名與後續欄位若沒有空白分隔時的防呆（如「國統發佈時間：20260826…」）。
+
+    必須連欄位冒號一起比對，否則像「說明科技」「發言人科技」這種公司名
+    會被切成空字串。
+    """
+    name = (raw or "").strip()
+    for label in ("發佈時間", "發言人職稱", "發言人", "說明"):
+        for colon in ("：", ":"):
+            name = name.split(label + colon)[0]
+    return name.strip()
+
+
 def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out: List[Dict[str, Any]] = []

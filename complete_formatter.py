@@ -13,7 +13,12 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
 
 from telegram_date_utils import (
+    COMPANY_RE,
+    PUBLISH_TIME_RE,
+    SPEAKER_RE,
+    SPEAKER_TITLE_RE,
     TW,
+    clean_company_name,
     dedupe_rows,
     filter_rows_today,
     today_yyyymmdd,
@@ -92,23 +97,23 @@ class CompleteFormatter:
         info = {}
         
         # 提取公司代號和名稱
-        company_match = re.search(r'#(\d+)\s*#([^發佈]+)', text)
+        company_match = COMPANY_RE.search(text)
         if company_match:
             info['code'] = company_match.group(1)
-            info['name'] = company_match.group(2).strip()
-        
+            info['name'] = clean_company_name(company_match.group(2))
+
         # 提取發言人
-        speaker_match = re.search(r'發言人：\s*([^發言人職稱]+)', text)
+        speaker_match = SPEAKER_RE.search(text)
         if speaker_match:
             info['speaker'] = speaker_match.group(1).strip()
-        
+
         # 提取發言人職稱
-        title_match = re.search(r'發言人職稱：\s*([^說明]+)', text)
+        title_match = SPEAKER_TITLE_RE.search(text)
         if title_match:
             info['title'] = title_match.group(1).strip()
-        
+
         # 提取發佈時間
-        time_match = re.search(r'發佈時間：(\d{8}\s+\d{2}:\d{2}:\d{2})', text)
+        time_match = PUBLISH_TIME_RE.search(text)
         if time_match:
             info['publish_time'] = time_match.group(1)
         
