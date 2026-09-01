@@ -13,7 +13,12 @@ import re
 from datetime import datetime
 
 from telegram_date_utils import (
+    COMPANY_RE,
+    PUBLISH_TIME_RE,
+    SPEAKER_RE,
+    SPEAKER_TITLE_RE,
     TW,
+    clean_company_name,
     dedupe_rows,
     filter_rows_today,
     filter_rows_within_days,
@@ -172,25 +177,24 @@ def main():
             sender = row.get('from', '')
             
             # 提取公司資訊
-            import re
-            company_match = re.search(r'#(\d+)\s*#([^發佈]+)', text)
+            company_match = COMPANY_RE.search(text)
             if company_match:
                 company_code = company_match.group(1)
-                company_name = company_match.group(2).strip()
+                company_name = clean_company_name(company_match.group(2))
             else:
                 company_code = "未知"
                 company_name = "未知公司"
-            
+
             # 提取發言人
-            speaker_match = re.search(r'發言人：\s*([^發言人職稱]+)', text)
+            speaker_match = SPEAKER_RE.search(text)
             speaker = speaker_match.group(1).strip() if speaker_match else "未提供"
-            
+
             # 提取發言人職稱
-            title_match = re.search(r'發言人職稱：\s*([^說明]+)', text)
+            title_match = SPEAKER_TITLE_RE.search(text)
             title = title_match.group(1).strip() if title_match else "未提供"
             
             # 提取發佈時間
-            time_match = re.search(r'發佈時間：(\d{8}\s+\d{2}:\d{2}:\d{2})', text)
+            time_match = PUBLISH_TIME_RE.search(text)
             publish_time = time_match.group(1) if time_match else "未提供"
             
             # 判斷公告類型
@@ -305,8 +309,10 @@ def main():
                 companies.add(company_match.group(1))
         
         f.write("📋 公告類型統計：\n")
+        # 分母須為「台北今日」則數（rows 是過濾前的合併列數，會讓百分比加不到 100%）
+        total_today = len(rows_today)
         for announcement_type, count in sorted(type_counts.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / len(rows) * 100) if len(rows) > 0 else 0
+            percentage = (count / total_today * 100) if total_today > 0 else 0
             f.write(f"  • {announcement_type}：{count} 則 ({percentage:.1f}%)\n")
         
         f.write(f"\n🏢 涉及公司數：{len(companies)}\n")
