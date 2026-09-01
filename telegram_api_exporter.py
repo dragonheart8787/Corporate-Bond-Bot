@@ -22,8 +22,8 @@ import os
 import re
 import sys
 import csv
-import time
 import json
+import asyncio
 import argparse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -75,6 +75,13 @@ def _message_to_row(msg) -> Dict:
     }
 
 
+# 單頁／單次讀取的重試上限。舊版是無上限的 while True，遇到持續性錯誤
+# （session 失效、entity 無權限）會一直重試到外層 subprocess timeout 才被殺掉。
+MAX_READ_RETRY = 5
+MAX_FLOOD_RETRY = 3
+MAX_FLOOD_WAIT_SEC = 300
+
+
 async def _fetch_today_paginated(entity, client, page_size: int, max_total: int) -> List[Dict]:
     """由最新訊息往舊分頁，直到本頁最舊一則已早於台北「今日」或達上限（避免只抓 N 則漏掉清晨公告）。"""
     from telethon.errors import FloodWaitError
@@ -86,19 +93,33 @@ async def _fetch_today_paginated(entity, client, page_size: int, max_total: int)
     page_idx = 0
 
     while len(rows) < max_total:
-        batch_msgs = []
+        batch_msgs: List = []
+        retry = 0
+        flood_retry = 0
         while True:
+            # 每次重試都從空清單重來：舊版沿用上次失敗殘留的內容，會把同一頁訊息重複寫進 CSV
+            batch_msgs = []
             try:
                 async for msg in client.iter_messages(entity, limit=page_size, offset_id=offset_id):
                     batch_msgs.append(msg)
                 break
             except FloodWaitError as fe:
                 wait = int(getattr(fe, "seconds", 5) or 5)
-                safe_print(f"⚠️ 頻率限制，等待 {wait} 秒後重試（分頁）...")
-                time.sleep(wait)
+                flood_retry += 1
+                if wait > MAX_FLOOD_WAIT_SEC or flood_retry > MAX_FLOOD_RETRY:
+                    raise RuntimeError(
+                        f"Telegram 頻率限制過久（需等 {wait}s，第 {flood_retry} 次），放棄分頁抓取"
+                    ) from fe
+                safe_print(f"⚠️ 頻率限制，等待 {wait} 秒後重試（分頁 {flood_retry}/{MAX_FLOOD_RETRY}）...")
+                await asyncio.sleep(wait)
             except Exception as e:
-                safe_print(f"⚠️ 分頁讀取錯誤：{e}，{backoff:.1f}s 後重試...")
-                time.sleep(backoff)
+                retry += 1
+                if retry >= MAX_READ_RETRY:
+                    # 不吞掉錯誤：靜默回傳半套資料會覆寫今日 CSV 並漏掉公告，
+                    # 寧可讓 main() 以非 0 結束，交給 auto_telegram_daily 的 --today-only 備援。
+                    raise RuntimeError(f"分頁讀取連續失敗 {retry} 次，放棄：{e}") from e
+                safe_print(f"⚠️ 分頁讀取錯誤：{e}，{backoff:.1f}s 後重試（{retry}/{MAX_READ_RETRY}）...")
+                await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
         if not batch_msgs:
@@ -276,32 +297,47 @@ async def connect_and_fetch(
 
     if paginate_today:
         safe_print(f"ℹ️ 分頁抓取台北「今日」訊息（每頁 {page_size}，累計上限 {max_total}）")
-        rows = await _fetch_today_paginated(entity, client, page_size, max_total)
-        await client.disconnect()
+        try:
+            rows = await _fetch_today_paginated(entity, client, page_size, max_total)
+        finally:
+            await client.disconnect()
         rows.sort(key=lambda r: r["date"], reverse=True)
         return rows
 
     rows: List[Dict] = []
-    fetched = 0
     backoff = 2.0
-    while fetched < limit:
-        try:
-            async for msg in client.iter_messages(entity, limit=limit, offset_id=0):
-                rows.append(_message_to_row(msg))
-                fetched += 1
-                if fetched >= limit:
-                    break
-            break
-        except FloodWaitError as fe:
-            wait = int(getattr(fe, 'seconds', 5) or 5)
-            safe_print(f'⚠️ 頻率限制，等待 {wait} 秒後重試...')
-            time.sleep(wait)
-        except Exception as e:
-            safe_print(f'⚠️ 讀取錯誤：{e}，{backoff:.1f}s 後重試...')
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-    await client.disconnect()
+    retry = 0
+    flood_retry = 0
+    try:
+        while True:
+            # 重試一律從 offset_id=0 重讀，因此每次都要清空，否則已抓過的訊息會被重複 append
+            rows = []
+            fetched = 0
+            try:
+                async for msg in client.iter_messages(entity, limit=limit, offset_id=0):
+                    rows.append(_message_to_row(msg))
+                    fetched += 1
+                    if fetched >= limit:
+                        break
+                break
+            except FloodWaitError as fe:
+                wait = int(getattr(fe, 'seconds', 5) or 5)
+                flood_retry += 1
+                if wait > MAX_FLOOD_WAIT_SEC or flood_retry > MAX_FLOOD_RETRY:
+                    raise RuntimeError(
+                        f'Telegram 頻率限制過久（需等 {wait}s，第 {flood_retry} 次），放棄抓取'
+                    ) from fe
+                safe_print(f'⚠️ 頻率限制，等待 {wait} 秒後重試（{flood_retry}/{MAX_FLOOD_RETRY}）...')
+                await asyncio.sleep(wait)
+            except Exception as e:
+                retry += 1
+                if retry >= MAX_READ_RETRY:
+                    raise RuntimeError(f'讀取連續失敗 {retry} 次，放棄：{e}') from e
+                safe_print(f'⚠️ 讀取錯誤：{e}，{backoff:.1f}s 後重試（{retry}/{MAX_READ_RETRY}）...')
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+    finally:
+        await client.disconnect()
     # 依時間排序（新到舊）
     rows.sort(key=lambda r: r['date'], reverse=True)
     return rows
@@ -360,7 +396,6 @@ async def main():
 
 
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())
 
 
