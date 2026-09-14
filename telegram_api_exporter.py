@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Dict
 
+from telegram_date_utils import report_yyyymmdd, report_yyyy_mm_dd
+
 # 與 MOPS／台股情境一致，「今日」與顯示時間一律用亞洲／台北
 _TW = ZoneInfo("Asia/Taipei")
 
@@ -86,7 +88,9 @@ async def _fetch_today_paginated(entity, client, page_size: int, max_total: int)
     """由最新訊息往舊分頁，直到本頁最舊一則已早於台北「今日」或達上限（避免只抓 N 則漏掉清晨公告）。"""
     from telethon.errors import FloodWaitError
 
-    today_date = datetime.now(_TW).date()
+    # 目標日期統一由 report_yyyymmdd 決定（含跨午夜回退與 REPORT_DATE 覆寫）
+    d = report_yyyymmdd()
+    today_date = datetime(int(d[:4]), int(d[4:6]), int(d[6:8]), tzinfo=_TW).date()
     rows: List[Dict] = []
     offset_id = 0
     backoff = 2.0
@@ -172,7 +176,7 @@ def extract_links(text: str) -> List[str]:
 
 def write_outputs(rows: List[Dict], out_dir: str) -> Dict[str, str]:
     ensure_dir(out_dir)
-    today = datetime.now(_TW).strftime('%Y%m%d')
+    today = report_yyyymmdd()
     csv_path = os.path.join(out_dir, f'telegram_messages_{today}.csv')
     txt_path = os.path.join(out_dir, f'telegram_messages_{today}.txt')
 
@@ -378,7 +382,7 @@ async def main():
         )
 
         if args.today_only and not args.paginate_today:
-            today_str = datetime.now(_TW).strftime('%Y-%m-%d')
+            today_str = report_yyyy_mm_dd()
             original_count = len(rows)
             rows = [r for r in rows if r.get('date', '').startswith(today_str)]
             safe_print(f'ℹ️ 今日訊息篩選：{original_count} → {len(rows)} 則')

@@ -7,8 +7,9 @@ name: 每日公司債自動抓取與 Telegram 通知
 # 3) 同上頁 Workflow permissions 建議選「Read and write」（要 push reports）。
 # 4) 開 Actions → 左欄點本 workflow → 若出現排程已停用（disabled），按 Enable。
 # 5) 倉庫長期無活動時 GitHub 會自動暫停 scheduled workflows；任意 push 或手動 Enable 可恢復。
-# 6) 排程以 UTC 為準；本 workflow 為台北 19:00 → UTC 11:00，推送後請等該時段之後數分鐘再看是否有 run。
-#    注意：GitHub 免費版 cron 常延遲數十分鐘到數小時，實際開跑時間會晚於 19:00。
+# 6) 排程以 UTC 為準；主排程台北 18:23（UTC 10:23）、備援台北 22:47（UTC 14:47）。
+#    GitHub 排程常延遲數十分鐘到數小時，甚至整個略過（2026-09-14 就沒跑），所以才有備援那班。
+#    延遲若跨過台北午夜，報告日期會自動回退為前一日（見 telegram_date_utils.report_yyyymmdd）。
 # 7) 備援：若 GitHub 排程未跑，請用 PAT 觸發「workflow_dispatch」（scripts/Trigger-GitHubDailyWorkflow.ps1），
 #    勿再使用 repository_dispatch：過去若曾設定 n8n/cron/雲端 POST daily-run，會在任意時間觸發發送。
 # 8) 診斷：workflow「Schedule smoke test」可手動 Run 驗證 Actions；已關閉其 cron 以免混淆。
@@ -17,8 +18,13 @@ name: 每日公司債自動抓取與 Telegram 通知
 
 on:
   schedule:
-    # 每日台北時間 19:00（UTC 11:00，cron 為 UTC）。與 env TZ: Asia/Taipei 一致。
-    - cron: "0 11 * * *"
+    # 主排程：台北 18:23（UTC 10:23）。刻意避開整點 —— 整點是 GitHub 最壅塞的時段，
+    # 本 repo 的延遲曾從 25 分惡化到 4 小時，2026-09-14 甚至整個 run 被丟棄。
+    - cron: "23 10 * * *"
+    # 備援排程：台北 22:47（UTC 14:47）。若主排程被 GitHub 略過，這班會補跑；
+    # 若主排程已成功發送，send 會因 SKIP_IF_ALREADY_SENT 讀到 reports/.last_sent 而略過，
+    # 不會重複發 Telegram。備援若被延遲到台北午夜後，報告日期會自動回退為前一日。
+    - cron: "47 14 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -66,7 +72,7 @@ jobs:
           echo "UTC=$(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "TW=$(date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "=========================================="
-          echo "schedule = GitHub cron (this repo: daily 19:00 Taipei = UTC 11:00; GitHub may delay it by hours)"
+          echo "schedule = GitHub cron (primary 18:23 Taipei / backup 22:47 Taipei; GitHub may delay or skip runs)"
           echo "workflow_dispatch = manual Run, PAT script, or Windows Task Scheduler"
           echo "If sends are every few minutes: check Task Scheduler + old n8n hitting workflow API."
 
@@ -78,6 +84,17 @@ jobs:
 
       - name: 📦 安裝套件
         run: pip install -r requirements.txt
+
+      # 日期解析一次就好：後續 fetch / 存檔 / send 全部吃同一個 REPORT_DATE，
+      # 避免 job 執行中跨過台北午夜時，各步驟算出不同日期。
+      - name: 📅 解析報告目標日期
+        run: |
+          RD=$(python main.py report-date)
+          echo "REPORT_DATE=${RD}" >> "$GITHUB_ENV"
+          echo "報告目標日期：${RD}（現在台北 $(date '+%Y-%m-%d %H:%M')）"
+          if [ "${RD}" != "$(date +%Y%m%d)" ]; then
+            echo "::warning::排程延遲已跨過台北午夜，報告日期回退為 ${RD}"
+          fi
 
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
@@ -105,13 +122,12 @@ jobs:
         if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
           mkdir -p reports
-          TODAY=$(date +%Y%m%d)
-          REPORT="outputs/daily/complete_report_${TODAY}.txt"
+          REPORT="outputs/daily/complete_report_${REPORT_DATE}.txt"
           if [ -f "$REPORT" ]; then
             cp "$REPORT" "reports/complete_report_latest.txt"
             echo "✅ 已複製 ${REPORT} → reports/complete_report_latest.txt"
           else
-            echo "::warning::未產生 outputs/daily/complete_report_${TODAY}.txt，不覆寫 reports/（避免把 4/30 等舊報告當最新送出）"
+            echo "::warning::未產生 outputs/daily/complete_report_${REPORT_DATE}.txt，不覆寫 reports/（避免把 4/30 等舊報告當最新送出）"
           fi
 
       # 先發送再 git push：避免 push 網路延遲／重試卡住 Telegram 10～20+ 分鐘（send 讀 runner 上檔案即可）
@@ -137,6 +153,9 @@ jobs:
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
           TELEGRAM_APPEND_ACTIONS_MARKER: "1"
+          # 備援排程防重發：若 reports/.last_sent 已是本次 REPORT_DATE 就略過發送。
+          # 手動 workflow_dispatch 不套用，方便隨時重送。
+          SKIP_IF_ALREADY_SENT: ${{ github.event_name == 'schedule' }}
           # 僅在「本 job 已跑過 fetch」時略過 send 內二次 fetch；單獨 mode=send 時仍允許重試抓取
           SKIP_SEND_REFETCH_ON_EMPTY: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
@@ -147,18 +166,30 @@ jobs:
           echo "- run: ${{ github.run_id }} / attempt ${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 台灣時間: $(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_STEP_SUMMARY"
 
+      # note: send 步驟會寫 reports/.last_sent，所以這步不能只在 mode != 'send' 時跑，
+      # 否則備援排程的防重發標記永遠不會被提交。
       - name: 📝 Commit 報告到 GitHub
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add reports/
           if git diff --staged --quiet; then
             echo "無變更，略過 commit"
-          else
-            git commit -m "update: 每日報告 $(date '+%Y-%m-%d')"
-            git push || echo "::warning::git push 失敗（Telegram 已送出）"
+            exit 0
           fi
+          git commit -m "update: 每日報告 ${REPORT_DATE:-$(date '+%Y-%m-%d')}"
+          # 備援排程與主排程可能接連跑，push 前先 rebase，避免標記因 non-fast-forward 掉失
+          for i in 1 2 3; do
+            if git push; then
+              echo "✅ push 成功"
+              exit 0
+            fi
+            echo "push 失敗，pull --rebase 後重試 ($i/3)"
+            git pull --rebase origin master || true
+            sleep $((i * 3))
+          done
+          echo "::warning::git push 最終失敗（Telegram 已送出，但 .last_sent 未入庫，備援可能重發）"
 
       - name: 📦 上傳每日報告（保留 30 天）
         if: always()

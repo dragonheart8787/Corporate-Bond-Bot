@@ -4,9 +4,15 @@
 公司債每日自動化主程式（GitHub Actions 入口）
 
 用法：
-  python main.py fetch   → 執行 auto_telegram_daily.py（抓取 + 格式化 + 生成 complete_report）
-  python main.py send    → 讀取 complete_report 並傳送至 Telegram Bot
-  python main.py all     → fetch + send（測試用）
+  python main.py fetch        → 執行 auto_telegram_daily.py（抓取 + 格式化 + 生成 complete_report）
+  python main.py send         → 讀取 complete_report 並傳送至 Telegram Bot
+  python main.py all          → fetch + send（測試用）
+  python main.py report-date  → 印出本次報告的目標日期（YYYYMMDD），供 workflow 使用
+
+環境變數：
+  REPORT_DATE             強制指定報告日期（YYYYMMDD 或 YYYY-MM-DD），用於補跑
+  REPORT_ROLLOVER_HOUR    台北幾點前視為「延遲跨日」而回退為昨日（預設 6）
+  SKIP_IF_ALREADY_SENT    =1 時，若該日期已成功發送過就略過（備援排程用）
 """
 
 import os
@@ -15,8 +21,13 @@ import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from telegram_date_utils import report_yyyymmdd
+
 # 與 quick_format / exporter 一致，避免「固定 UTC+8」與 IANA 時區在邊界日期不一致
 _TWZ = ZoneInfo("Asia/Taipei")
+
+# 記錄「最後一次成功發送的報告日期」，讓備援排程不會把同一天的報告重發一次
+SENT_MARKER = os.path.join("reports", ".last_sent")
 
 
 def safe_print(msg: str) -> None:
@@ -27,7 +38,30 @@ def safe_print(msg: str) -> None:
 
 
 def today_str() -> str:
-    return datetime.now(_TWZ).strftime("%Y%m%d")
+    """報告目標日期（含延遲跨午夜回退與 REPORT_DATE 覆寫）。"""
+    return report_yyyymmdd()
+
+
+def _truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def already_sent(date_str: str) -> bool:
+    try:
+        with open(SENT_MARKER, "r", encoding="utf-8") as f:
+            return f.read().strip() == date_str
+    except OSError:
+        return False
+
+
+def mark_sent(date_str: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(SENT_MARKER), exist_ok=True)
+        with open(SENT_MARKER, "w", encoding="utf-8") as f:
+            f.write(date_str + "\n")
+        safe_print(f"📝 已記錄發送標記：{SENT_MARKER} = {date_str}")
+    except OSError as e:
+        safe_print(f"⚠️ 無法寫入發送標記（{e}），備援排程可能重發")
 
 
 def report_path() -> str:
@@ -118,6 +152,8 @@ def mode_fetch() -> None:
     # 將 GitHub Secrets 傳入子行程環境變數
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    # 日期在此釘死，整條管線（exporter / formatter）都用同一天，避免跨午夜各算各的
+    env["REPORT_DATE"] = today_str()
 
     safe_print("▶ 執行 auto_telegram_daily.py ...")
     result = subprocess.run(
@@ -184,7 +220,9 @@ def filter_cb_only(full_report: str) -> str:
       ...
       📢 澄清媒體報導 (N 則)  ← 下一個非CB區段（用此作為結尾）
     """
-    date_str = datetime.now(_TWZ).strftime("%Y-%m-%d")
+    # 用報告目標日期，不是「現在」：延遲跨午夜時內容是前一日的，標題不能寫成今天
+    d = today_str()
+    date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
     # ── 找 CB 區段的開始位置 ──
     CB_SECTION_MARKERS = [
@@ -250,6 +288,17 @@ def mode_send() -> None:
             f"RUN_ID={os.environ.get('GITHUB_RUN_ID', '')!r} "
             f"ACTOR={os.environ.get('GITHUB_ACTOR', '')!r}"
         )
+
+    target_date = today_str()
+    if target_date != datetime.now(_TWZ).strftime("%Y%m%d"):
+        safe_print(
+            f"ℹ️  現在是台北 {datetime.now(_TWZ):%H:%M}，判定為延遲跨日，報告目標日期為 {target_date}"
+        )
+
+    # 備援排程用：若這一天已經成功發送過，就不要再送一次
+    if _truthy("SKIP_IF_ALREADY_SENT") and already_sent(target_date):
+        safe_print(f"✅ {target_date} 的報告先前已成功發送（{SENT_MARKER}），略過本次發送")
+        return
 
     bot_token, chat_id = load_bot_credentials()
 
@@ -327,7 +376,9 @@ def mode_send() -> None:
     ok = send_telegram(bot_token, chat_id, content)
     if ok:
         safe_print("✅ Telegram 傳送完成！")
+        mark_sent(target_date)
     else:
+        # 部分失敗不寫標記，讓備援排程有機會補送
         safe_print("⚠️ 部分段落發送失敗")
         sys.exit(1)
 
@@ -346,8 +397,11 @@ def main() -> None:
         mode_fetch()
         safe_print("\n▶ 直接發送（all 模式）")
         mode_send()
+    elif mode == "report-date":
+        # 供 workflow 解析一次日期後傳給所有步驟（見 daily.yml）
+        print(today_str())
     else:
-        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all）")
+        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all / report-date）")
         sys.exit(1)
 
 

@@ -22,7 +22,7 @@ from telegram_date_utils import (
     dedupe_rows,
     filter_rows_today,
     filter_rows_within_days,
-    today_yyyymmdd,
+    report_yyyymmdd,
     yyyymmdd_from_csv_filename,
 )
 
@@ -40,7 +40,7 @@ def main():
     safe_print("📝 快速格式化 Telegram 公告")
     safe_print("=" * 50)
     
-    today = today_yyyymmdd()
+    today = report_yyyymmdd()
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):

@@ -14,6 +14,8 @@ import csv
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from telegram_date_utils import report_yyyymmdd
+
 _TW = ZoneInfo("Asia/Taipei")
 
 
@@ -79,7 +81,11 @@ def main():
     ensure_dir('outputs/daily')
     ensure_dir('outputs/daily/logs')
     
-    today_str = datetime.now(_TW).strftime('%Y%m%d')
+    # 解析一次目標日期，並固定傳給所有子行程，避免各自算 now() 在午夜前後不一致
+    today_str = report_yyyymmdd()
+    os.environ['REPORT_DATE'] = today_str
+    if today_str != datetime.now(_TW).strftime('%Y%m%d'):
+        safe_print(f"ℹ️  現在是台北 {datetime.now(_TW):%H:%M}，判定為延遲跨日，報告目標日期回退為 {today_str}")
     py = sys.executable
     # GitHub Secrets 與本機一致：與 daily.yml 的 TELEGRAM_CHAT_NAME 對齊
     chat = (os.environ.get("TELEGRAM_CHAT_NAME") or "").strip()
