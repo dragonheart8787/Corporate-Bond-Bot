@@ -21,7 +21,7 @@ from telegram_date_utils import (
     clean_company_name,
     dedupe_rows,
     filter_rows_today,
-    today_yyyymmdd,
+    report_yyyymmdd,
 )
 
 _TW = TW
@@ -364,7 +364,7 @@ def main():
     formatter = CompleteFormatter()
     
     # 讀取今日的 Telegram 資料
-    today = today_yyyymmdd()
+    today = report_yyyymmdd()
     csv_path = f'outputs/daily/telegram_messages_{today}.csv'
     
     if not os.path.exists(csv_path):

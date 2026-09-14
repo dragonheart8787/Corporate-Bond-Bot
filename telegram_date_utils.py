@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,49 @@ TW = ZoneInfo("Asia/Taipei")
 
 def today_yyyymmdd() -> str:
     return datetime.now(TW).strftime("%Y%m%d")
+
+
+# 台北 00:00 ~ ROLLOVER_HOUR 之間執行，視為「前一天的排程被延遲跨過午夜」
+DEFAULT_ROLLOVER_HOUR = 6
+
+
+def _normalize_yyyymmdd(value: str) -> Optional[str]:
+    v = (value or "").strip().replace("/", "-")
+    m = re.match(r"^(\d{4})-?(\d{2})-?(\d{2})$", v)
+    return f"{m.group(1)}{m.group(2)}{m.group(3)}" if m else None
+
+
+def report_yyyymmdd(now: Optional[datetime] = None) -> str:
+    """
+    報告的目標日期（台北，YYYYMMDD）。整條管線都應該用它，而不是各自算 now()。
+
+    兩個問題要解決：
+    1. GitHub 排程常延遲 3～5 小時，偶爾會把 run 推過台北午夜。此時「今日」才剛
+       開始，抓到 0 則，報告等於空的（8/27、9/7 都是這樣）。因此落在
+       00:00 ~ REPORT_ROLLOVER_HOUR（預設 6 點）時，改用昨日。
+    2. 補跑：REPORT_DATE 可強制指定日期（YYYYMMDD 或 YYYY-MM-DD）。
+
+    主流程解析一次後，會用 REPORT_DATE 傳給子行程，避免各行程跨過邊界時算出不同日期。
+    """
+    forced = _normalize_yyyymmdd(os.environ.get("REPORT_DATE", ""))
+    if forced:
+        return forced
+
+    now = now or datetime.now(TW)
+    try:
+        rollover = int(os.environ.get("REPORT_ROLLOVER_HOUR", DEFAULT_ROLLOVER_HOUR))
+    except ValueError:
+        rollover = DEFAULT_ROLLOVER_HOUR
+    rollover = max(0, min(rollover, 12))
+
+    if now.hour < rollover:
+        return (now - timedelta(days=1)).strftime("%Y%m%d")
+    return now.strftime("%Y%m%d")
+
+
+def report_yyyy_mm_dd(now: Optional[datetime] = None) -> str:
+    d = report_yyyymmdd(now)
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
 
 def today_yyyy_mm_dd() -> str:
