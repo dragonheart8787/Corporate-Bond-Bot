@@ -395,7 +395,21 @@ async def main():
         safe_print('⏹️ 已中止')
         sys.exit(1)
     except Exception as e:
-        safe_print(f'❌ 匯出失敗：{e}')
+        msg = str(e)
+        safe_print(f'❌ 匯出失敗：{msg}')
+        if 'two different IP addresses' in msg or 'AuthKeyDuplicated' in type(e).__name__:
+            safe_print('')
+            safe_print('=' * 60)
+            safe_print('❗ TELEGRAM_SESSION_STRING 已被 Telegram 撤銷，無法再使用。')
+            safe_print('   原因：同一組 session 被兩台機器（不同 IP）同時連線。')
+            safe_print('   這通常是有多個 workflow run 並行、各自跑了一次抓取造成的。')
+            safe_print('')
+            safe_print('   補救（只能在本機做，需要手機收驗證碼）：')
+            safe_print('     1. python get_session_string.py')
+            safe_print('     2. 把輸出的字串更新到 GitHub Secrets 的 TELEGRAM_SESSION_STRING')
+            safe_print('   重新產生前請先確認沒有多個 bot / daily workflow 同時在跑，')
+            safe_print('   否則新的 session 會再次被撤銷。')
+            safe_print('=' * 60)
         sys.exit(2)
 
 

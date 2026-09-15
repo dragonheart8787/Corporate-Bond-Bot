@@ -158,7 +158,9 @@ def main():
     if not os.path.exists(csv_path):
         safe_print(f"\n❌ 找不到訊息檔：{csv_path}")
         safe_print("請確認 TELEGRAM_* Secrets、TELEGRAM_CHAT_NAME 與 telegram_api_exporter.py")
-        return
+        # 必須以非 0 結束：舊版 return 會讓 main.py 印出「✅ 完成」，
+        # 真正的錯誤（例如 session 被撤銷）就被蓋掉了
+        sys.exit(3)
     
     # 步驟 2：格式化與分類（只處理今日訊息）
     step2_success = run_step(
@@ -169,7 +171,7 @@ def main():
     
     if not step2_success:
         safe_print("\n⚠️ 格式化失敗")
-        return
+        sys.exit(4)
     
     # 步驟 3：生成完整分析報告（含轉換公司債優先）
     step3_success = run_step(

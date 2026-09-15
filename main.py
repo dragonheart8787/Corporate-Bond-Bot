@@ -144,7 +144,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
 # ─────────────────────────────────────────
 # MODE: fetch — 執行 auto_telegram_daily.py
 # ─────────────────────────────────────────
-def mode_fetch() -> None:
+def mode_fetch() -> bool:
     safe_print("\n" + "=" * 55)
     safe_print(f"📥 [FETCH] {datetime.now(_TWZ).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
     safe_print("=" * 55)
@@ -168,18 +168,26 @@ def mode_fetch() -> None:
     else:
         safe_print("✅ auto_telegram_daily.py 完成")
 
-    # 確認 complete_report 是否已生成
-    path = report_path()
-    if os.path.exists(path):
-        size = os.path.getsize(path)
-        safe_print(f"✅ complete_report 已就緒：{path}（{size:,} bytes）")
-    else:
-        safe_print(f"❌ 找不到 complete_report：{path}")
-        # GitHub Actions：仍讓 job 繼續，後續 send 可用 reports/complete_report_latest.txt
-        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
-            safe_print("ℹ️  GITHUB_ACTIONS：不結束 job，send 將嘗試 repo 內備份報告")
-            return
-        sys.exit(1)
+    # 確認 complete_report 是否「本次新生成」。
+    # 注意不能用 report_path()：它會退回 reports/complete_report_latest.txt，
+    # 於是抓取整個失敗時仍印出「✅ 已就緒」，把 session 被撤銷這類錯誤蓋掉。
+    fresh = os.path.join("outputs", "daily", f"complete_report_{today_str()}.txt")
+    if os.path.exists(fresh):
+        size = os.path.getsize(fresh)
+        safe_print(f"✅ complete_report 已就緒：{fresh}（{size:,} bytes）")
+        return True
+
+    safe_print(f"❌ 本次未產生 complete_report：{fresh}")
+    if result.returncode != 0:
+        safe_print(f"   auto_telegram_daily.py 回傳碼 {result.returncode}，請往上看抓取步驟的錯誤訊息")
+
+    fallback = os.path.join("reports", "complete_report_latest.txt")
+    if os.path.exists(fallback):
+        safe_print(f"ℹ️  repo 內有備份報告 {fallback}，但那是舊的，不代表本次抓取成功")
+
+    # 不在這裡 exit：mode_send 與 all 會內部呼叫本函式，硬中斷會讓發送步驟被跳過。
+    # 由 main() 依回傳值決定行程結束碼。
+    return False
 
 
 # ─────────────────────────────────────────
@@ -390,13 +398,16 @@ def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
 
     if mode == "fetch":
-        mode_fetch()
+        if not mode_fetch():
+            sys.exit(1)
     elif mode == "send":
         mode_send()
     elif mode == "all":
-        mode_fetch()
+        ok = mode_fetch()
         safe_print("\n▶ 直接發送（all 模式）")
-        mode_send()
+        mode_send()          # 抓取失敗仍嘗試發送（可能用 repo 內備份報告）
+        if not ok:
+            sys.exit(1)
     elif mode == "report-date":
         # 供 workflow 解析一次日期後傳給所有步驟（見 daily.yml）
         print(today_str())
