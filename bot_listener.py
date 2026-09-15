@@ -12,6 +12,7 @@ Telegram Bot 指令監聽器（部署於 GitHub Actions）
 
 import glob
 import os
+import re
 import sys
 import time
 import base64
@@ -32,6 +33,9 @@ PRE_FETCH_DELAY_SEC = int(os.environ.get("BOT_PRE_FETCH_DELAY_SEC", "4"))
 POST_FETCH_DELAY_SEC = int(os.environ.get("BOT_POST_FETCH_DELAY_SEC", "6"))
 # 無新訊息時避免狂打 getUpdates
 IDLE_SLEEP_SEC = 0.8
+
+# getUpdates 衝突次數（多實例互砍時會狂噴，只在特定次數輸出）
+_conflict_count = 0
 
 
 def safe_print(msg: str) -> None:
@@ -140,12 +144,48 @@ def get_report_updated_time(github_token: str, repo: str) -> str:
     return "未知"
 
 
-def load_report_text(github_token: str, repo: str) -> str | None:
-    """本地優先，失敗再用 GitHub。"""
+def report_generated_at(report: str) -> str:
+    """從報告標頭取出「生成時間」，取不到回空字串。"""
+    m = re.search(r"生成時間：\s*([\d\-]+\s+[\d:]+)", report or "")
+    return m.group(1) if m else ""
+
+
+def load_report_text(github_token: str, repo: str) -> tuple[str | None, str]:
+    """
+    回傳 (報告內容, 來源標籤)。來源：'local' = runner 上剛產生的，'github' = repo 存檔。
+
+    抓取失敗時會退回 repo 裡的存檔，那份可能是好幾天前的。舊版直接回傳、不做
+    區分，使用者看到的「生成時間」就一直卡在同一個值，看起來像時鐘壞掉，
+    實際上是報告根本沒更新。
+    """
     local = read_local_complete_report()
     if local:
-        return local
-    return get_report_from_github(github_token, repo)
+        return local, "local"
+    return get_report_from_github(github_token, repo), "github"
+
+
+def staleness_note(report: str, source: str) -> str:
+    """報告不是剛剛產生的話，回傳一段要附在訊息前面的提醒；夠新則回空字串。"""
+    gen = report_generated_at(report)
+    if not gen:
+        return ""
+    try:
+        gen_dt = datetime.strptime(gen, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TW_ZONE)
+    except ValueError:
+        return ""
+    age_min = (datetime.now(TW_ZONE) - gen_dt).total_seconds() / 60
+    if age_min <= 10:
+        return ""
+    if age_min < 120:
+        age = f"{int(age_min)} 分鐘前"
+    else:
+        age = f"{age_min / 60:.1f} 小時前"
+    where = "repo 內的存檔" if source == "github" else "先前產生的檔案"
+    return (
+        f"⚠️ 這份是{where}，生成於 {gen}（{age}），不是剛剛抓的。\n"
+        f"即時抓取未成功，請看 Actions log 或稍後再試。\n"
+        + "─" * 20 + "\n\n"
+    )
 
 
 # ─────────────────────────────────────────
@@ -252,7 +292,20 @@ def get_updates(token: str, offset: int) -> list:
         )
         data = resp.json()
         if not data.get("ok"):
-            desc = data.get("description", data)
+            desc = str(data.get("description", data))
+            if "Conflict" in desc:
+                # 同一個 token 不能有兩個 poller：Telegram 會互砍雙方的請求，
+                # offset 永遠推不動，指令被反覆重送、報告也更新不了。
+                # 這是設定問題不是暫時性錯誤，狂 retry 沒用，拉長間隔並講清楚。
+                global _conflict_count
+                _conflict_count += 1
+                if _conflict_count in (1, 10) or _conflict_count % 100 == 0:
+                    safe_print(
+                        f"❌ getUpdates 衝突（第 {_conflict_count} 次）：有另一個 bot 實例在跑。"
+                        " 請確認 bot.yml 的 concurrency 生效、並取消多餘的 workflow run。"
+                    )
+                time.sleep(5)
+                return []
             safe_print(f"⚠️ getUpdates 失敗：{desc}")
             return []
         return data.get("result", [])
@@ -315,12 +368,11 @@ def handle_report_command(
 
     time.sleep(POST_FETCH_DELAY_SEC)
 
-    report = load_report_text(github_token, github_repo)
+    report, source = load_report_text(github_token, github_repo)
     if report:
-        if mode == "all":
-            send_message(bot_token, chat_id, report)
-        else:
-            send_message(bot_token, chat_id, filter_cb_only(report))
+        note = staleness_note(report, source)
+        body = report if mode == "all" else filter_cb_only(report)
+        send_message(bot_token, chat_id, note + body)
     else:
         send_message(
             bot_token,
