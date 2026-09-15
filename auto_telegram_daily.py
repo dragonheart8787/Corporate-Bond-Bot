@@ -90,7 +90,9 @@ def main():
     # GitHub Secrets 與本機一致：與 daily.yml 的 TELEGRAM_CHAT_NAME 對齊
     chat = (os.environ.get("TELEGRAM_CHAT_NAME") or "").strip()
     if not chat:
-        chat = "📢 [非官方] 公開資訊觀測站 即時重大訊息"
+        # 用 @username 而非顯示名稱：頻道改名不會失效，也不必擔心 emoji/空白複製錯誤
+        # 來源：https://t.me/unofficial_tw_mpos_information
+        chat = "@unofficial_tw_mpos_information"
     safe_print(f"📌 頻道名稱（TELEGRAM_CHAT_NAME 或預設）：{chat}")
 
     def _csv_data_row_count(path: str) -> int:

@@ -285,6 +285,7 @@ async def connect_and_fetch(
         safe_print(f"無法找到聊天 '{chat}'，嘗試使用已知的聊天名稱...")
         # 嘗試使用已知的聊天名稱
         known_chats = [
+            "@unofficial_tw_mpos_information",   # 正式來源，改名也不失效
             "📢 [非官方] 公開資訊觀測站 即時重大訊息 (媒體/報導/澄清/注意交易)",
             "📢 [非官方] 公開資訊觀測站 即時重大訊息",
             "mops imformation catcher"
