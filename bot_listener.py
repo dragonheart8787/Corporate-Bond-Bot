@@ -20,6 +20,8 @@ import subprocess
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+from telegram_date_utils import report_yyyymmdd
+
 TW = timezone(timedelta(hours=8))
 TW_ZONE = ZoneInfo("Asia/Taipei")
 MAX_RUNTIME_SEC = 5 * 3600  # 每次 GitHub Actions Job 最多跑 5 小時
@@ -73,8 +75,9 @@ def run_fetch_subprocess() -> int:
 
 
 def read_local_complete_report() -> str | None:
-    """優先今日台北日期之 complete_report，否則取 outputs/daily 最新一份。"""
-    today = datetime.now(TW_ZONE).strftime("%Y%m%d")
+    """優先本次報告日期之 complete_report，否則取 outputs/daily 最新一份。"""
+    # 必須與 main.py fetch 寫檔時用的日期一致（含跨午夜回退），否則凌晨會對不到檔案
+    today = report_yyyymmdd()
     exact = os.path.join("outputs", "daily", f"complete_report_{today}.txt")
     if os.path.isfile(exact):
         try:
@@ -149,7 +152,9 @@ def load_report_text(github_token: str, repo: str) -> str | None:
 # 過濾：只保留轉換公司債公告
 # ─────────────────────────────────────────
 def filter_cb_only(full_report: str) -> str:
-    date_str = datetime.now(TW).strftime("%Y-%m-%d")
+    # 用報告日期而非「現在」：凌晨回退時內容是前一日的，標題不能寫成今天
+    _d = report_yyyymmdd()
+    date_str = f"{_d[:4]}-{_d[4:6]}-{_d[6:8]}"
     CB_START = [
         "🔥 轉換公司債相關公告",
         "轉換公司債相關公告",
@@ -211,6 +216,31 @@ def send_message(token: str, chat_id: str, text: str) -> None:
             except Exception:
                 time.sleep(3)
         time.sleep(0.3)
+
+
+def drop_pending_updates(token: str) -> int:
+    """
+    啟動時丟掉積壓的舊更新，回傳新的 offset。
+
+    getUpdates 的 offset=0 會把「尚未確認」的更新全部倒出來 —— 包含 bot 不在線
+    那段期間累積的（Telegram 最長保留 24 小時）。所以每次 job 重啟都會把舊的
+    /cb、/all 重跑一次，看起來就像同一個指令被抓了兩次。
+    offset=-1 只取最後一則，據此把 offset 推到它之後，等於清空積壓。
+    """
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": -1, "timeout": 0},
+            timeout=20,
+        )
+        data = resp.json()
+        if data.get("ok") and data.get("result"):
+            last_id = data["result"][-1]["update_id"]
+            safe_print(f"🧹 啟動清空積壓更新，offset 從 {last_id + 1} 開始（不重跑舊指令）")
+            return last_id + 1
+    except Exception as e:
+        safe_print(f"⚠️ 清空積壓更新失敗（{e}），改從 0 開始")
+    return 0
 
 
 def get_updates(token: str, offset: int) -> list:
@@ -314,7 +344,7 @@ def main() -> None:
 
     start_time = time.time()
     deadline = start_time + MAX_RUNTIME_SEC
-    offset = 0
+    offset = drop_pending_updates(bot_token)
 
     now_str = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
     end_str = datetime.fromtimestamp(deadline, TW).strftime("%H:%M:%S")

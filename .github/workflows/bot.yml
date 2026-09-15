@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# 全程只允許一個 bot 實例。多個實例會各自 poll getUpdates，同一則 /cb 可能被
+# 兩個實例同時取走並各跑一次抓取，使用者就會看到「抓兩次」、收到重複回覆。
+# cancel-in-progress: true → 新班次啟動時把舊的收掉，交接乾淨（舊的本來就快到 5 小時上限）。
+concurrency:
+  group: telegram-bot-listener
+  cancel-in-progress: true
+
 jobs:
   bot-listener:
     runs-on: ubuntu-latest
