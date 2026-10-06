@@ -2,20 +2,27 @@ name: Telegram Bot 指令監聽（24/7）
 
 on:
   schedule:
-    # 每 5 小時重啟一次（GitHub Actions 最長跑 6 小時）
-    # UTC: 0, 5, 10, 15, 20 點 → 台灣時間 8, 13, 18, 23, 4 點
-    - cron: "0 0,5,10,15,20 * * *"
+    # 每 2 小時嘗試啟動一次，刻意避開整點（整點是 GitHub 排程最壅塞、最容易被丟棄的時段）。
+    # 舊版是「每 5 小時一班、每班剛好跑 5 小時」，零重疊：只要 GitHub 丟掉或延遲任何一班，
+    # 就會出現數小時沒有 bot 的空窗（2026-10-06 實際發生：10:00、15:00 兩班都沒被建立）。
+    # 現在每班 5 小時、每 2 小時一次排程，任何 5 小時窗口內都有 2～3 次機會，
+    # 搭配下方 concurrency（不取消執行中的）讓後來的排隊接棒，不會重疊也不會空窗。
+    - cron: "17 */2 * * *"
   workflow_dispatch:   # 手動啟動
 
 permissions:
   contents: read
 
 # 全程只允許一個 bot 實例。多個實例會各自 poll getUpdates，同一則 /cb 可能被
-# 兩個實例同時取走並各跑一次抓取，使用者就會看到「抓兩次」、收到重複回覆。
-# cancel-in-progress: true → 新班次啟動時把舊的收掉，交接乾淨（舊的本來就快到 5 小時上限）。
+# 兩個實例同時取走並各跑一次抓取（還會讓同一組 Telegram session 從兩個 IP 同時連線而被撤銷）。
+#
+# cancel-in-progress: false —— 新班次「排隊等」，不砍掉執行中的：
+#   - 舊版 true 會在新班次一啟動就殺掉舊的，若剛好有人下指令、抓取做到一半就被中斷。
+#   - 排隊中的班次在舊的跑滿 5 小時結束後立刻接手，沒有空窗。
+#   - GitHub 同一 group 只保留最新的一個排隊，多出來的會顯示 cancelled，那是正常的。
 concurrency:
   group: telegram-bot-listener
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bot-listener:
