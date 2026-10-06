@@ -258,29 +258,98 @@ def send_message(token: str, chat_id: str, text: str) -> None:
         time.sleep(0.3)
 
 
-def drop_pending_updates(token: str) -> int:
-    """
-    啟動時丟掉積壓的舊更新，回傳新的 offset。
+# 啟動時，停機期間內下的指令只要不超過這個秒數就補處理；更舊的視為過期丟棄
+FRESH_COMMAND_MAX_AGE_SEC = int(os.environ.get("BOT_FRESH_COMMAND_MAX_AGE_SEC", "900"))
+KNOWN_COMMANDS = {"/all", "/cb", "/status", "/help", "/start"}
 
-    getUpdates 的 offset=0 會把「尚未確認」的更新全部倒出來 —— 包含 bot 不在線
-    那段期間累積的（Telegram 最長保留 24 小時）。所以每次 job 重啟都會把舊的
-    /cb、/all 重跑一次，看起來就像同一個指令被抓了兩次。
-    offset=-1 只取最後一則，據此把 offset 推到它之後，等於清空積壓。
+
+def extract_message(upd: dict) -> dict:
+    """從一則 update 取出訊息本體。頻道貼文（channel_post）也要認，否則在頻道下的指令會被默默忽略。"""
+    return (
+        upd.get("message")
+        or upd.get("edited_message")
+        or upd.get("channel_post")
+        or upd.get("edited_channel_post")
+        or {}
+    )
+
+
+def collect_pending_updates(token: str) -> tuple[int, list]:
     """
+    啟動時取回積壓更新，回傳 (新的 offset, 需要補處理的更新)。
+
+    getUpdates 的 offset=0 會倒出所有「尚未確認」的更新，包含 bot 停機期間累積的
+    （Telegram 保留 24 小時）。兩種做法都有問題：
+      - 全部重跑：每次 5 小時換班都會把舊的 /cb、/all 重跑一次（使用者看到「抓兩次」）。
+      - 全部丟掉（上一版）：bot 空窗期間使用者下的 /cb 被默默吃掉，上線後也不回應，
+        使用者只會覺得「指令不能用」。
+    折衷：只補處理「夠新」的指令（預設 15 分鐘內），且同一個聊天室重複下同一個指令只做一次；
+    其餘全部確認掉但不執行。
+    """
+    offset = 0
+    collected: list = []
     try:
-        resp = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params={"offset": -1, "timeout": 0},
-            timeout=20,
-        )
-        data = resp.json()
-        if data.get("ok") and data.get("result"):
-            last_id = data["result"][-1]["update_id"]
-            safe_print(f"🧹 啟動清空積壓更新，offset 從 {last_id + 1} 開始（不重跑舊指令）")
-            return last_id + 1
+        for _ in range(10):  # 每頁最多 100 則，最多翻 10 頁
+            resp = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": offset, "timeout": 0},
+                timeout=20,
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                safe_print(f"⚠️ 啟動取回積壓更新失敗：{data.get('description', data)}")
+                return offset, []
+            page = data.get("result", [])
+            if not page:
+                break
+            collected.extend(page)
+            offset = page[-1]["update_id"] + 1
+            if len(page) < 100:
+                break
     except Exception as e:
-        safe_print(f"⚠️ 清空積壓更新失敗（{e}），改從 0 開始")
-    return 0
+        safe_print(f"⚠️ 啟動取回積壓更新例外：{e}")
+        return offset, []
+
+    if not collected:
+        safe_print("🧹 啟動時沒有積壓更新")
+        return offset, []
+
+    now = time.time()
+    fresh: list = []
+    seen: set = set()
+    stale = dup = 0
+    for upd in collected:
+        msg = extract_message(upd)
+        text = (msg.get("text") or "").strip()
+        cmd = parse_command(text) if text else ""
+        age = now - float(msg.get("date") or 0)
+        if cmd not in KNOWN_COMMANDS or age > FRESH_COMMAND_MAX_AGE_SEC:
+            stale += 1
+            continue
+        key = (str(msg.get("chat", {}).get("id", "")), cmd)
+        if key in seen:
+            dup += 1
+            continue
+        seen.add(key)
+        fresh.append(upd)
+
+    safe_print(
+        f"🧹 啟動取回 {len(collected)} 則積壓更新：補處理 {len(fresh)} 則"
+        f"（{FRESH_COMMAND_MAX_AGE_SEC // 60} 分鐘內的指令）、過期或非指令 {stale} 則、重複 {dup} 則"
+    )
+    return offset, fresh
+
+
+def ack_updates(token: str, offset: int) -> None:
+    """結束前確認已處理的更新，避免下一棒 bot 把最後那幾則再取一次。"""
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": offset, "timeout": 0},
+            timeout=15,
+        )
+    except Exception:
+        pass
 
 
 def get_updates(token: str, offset: int) -> list:
@@ -396,7 +465,9 @@ def main() -> None:
 
     start_time = time.time()
     deadline = start_time + MAX_RUNTIME_SEC
-    offset = drop_pending_updates(bot_token)
+    offset, pending = collect_pending_updates(bot_token)
+    polls = received = 0
+    last_beat = time.time()
 
     now_str = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
     end_str = datetime.fromtimestamp(deadline, TW).strftime("%H:%M:%S")
@@ -405,7 +476,20 @@ def main() -> None:
     safe_print(f"   抓取前後停頓：{PRE_FETCH_DELAY_SEC}s / {POST_FETCH_DELAY_SEC}s")
 
     while time.time() < deadline:
-        updates = get_updates(bot_token, offset)
+        if pending:
+            updates, pending = pending, []
+        else:
+            updates = get_updates(bot_token, offset)
+            polls += 1
+
+        # 心跳：每 30 分鐘一行。沒有它，bot 靜悄悄跑 5 小時的 log 只有兩行，
+        # 完全分不出「沒人下指令」和「指令沒送進來」。
+        if time.time() - last_beat >= 1800:
+            last_beat = time.time()
+            safe_print(
+                f"💓 bot 運作中：已運行 {int((time.time() - start_time) / 60)} 分鐘、"
+                f"輪詢 {polls} 次、收到 {received} 則更新"
+            )
 
         if not updates:
             time.sleep(IDLE_SLEEP_SEC)
@@ -413,12 +497,15 @@ def main() -> None:
 
         for upd in updates:
             offset = upd["update_id"] + 1
-            msg = upd.get("message") or upd.get("edited_message", {})
+            received += 1
+            msg = extract_message(upd)
             if not msg:
+                safe_print(f"ℹ️ 略過非訊息更新：{[k for k in upd if k != 'update_id']}")
                 continue
             text = (msg.get("text") or "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
             if not text or not chat_id:
+                safe_print(f"ℹ️ 略過無文字訊息（chat={chat_id or '?'}）")
                 continue
 
             cmd = parse_command(text)
@@ -460,6 +547,7 @@ def main() -> None:
                     "📅 自動排程：每日台北 18:23 起（備援 19:37／20:53／22:47）。GitHub 排程常延遲數小時；若延遲跨過午夜，報告會自動改抓前一日。",
                 )
 
+    ack_updates(bot_token, offset)
     safe_print("⏹️  Bot 運行時間到，正常退出（GitHub Actions 將自動重新啟動）")
 
 
