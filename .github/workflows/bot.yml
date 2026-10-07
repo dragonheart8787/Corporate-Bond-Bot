@@ -1,25 +1,45 @@
 name: Telegram Bot 指令監聽（24/7）
 
 on:
+  # 備援（保留）：接力鏈是主要的續命方式，cron 只是在接力鏈斷掉時把 bot 拉起來。
+  # GitHub 的 cron 在這個 repo 上大量不觸發（實測 2026-10-07：預期約 11 次、實際只建立 3 個 run），
+  # 所以不能只靠它。避開整點（整點最壅塞）。
   schedule:
-    # 每 2 小時嘗試啟動一次，刻意避開整點（整點是 GitHub 排程最壅塞、最容易被丟棄的時段）。
-    # 舊版是「每 5 小時一班、每班剛好跑 5 小時」，零重疊：只要 GitHub 丟掉或延遲任何一班，
-    # 就會出現數小時沒有 bot 的空窗（2026-10-06 實際發生：10:00、15:00 兩班都沒被建立）。
-    # 現在每班 5 小時、每 2 小時一次排程，任何 5 小時窗口內都有 2～3 次機會，
-    # 搭配下方 concurrency（不取消執行中的）讓後來的排隊接棒，不會重疊也不會空窗。
     - cron: "17 */2 * * *"
-  workflow_dispatch:   # 手動啟動
+  workflow_dispatch:   # 手動啟動，也是 bot 接力觸發下一棒所用的事件
+    inputs:
+      # 以下三個由 bot 自己接力時帶入，手動啟動請留空。
+      handoff_prev_run_id:
+        description: "上一棒的 run id（接力用，手動啟動請留空）"
+        required: false
+        default: ""
+      handoff_min_update_id:
+        description: "交接水位線：update_id 小於此值視為前一棒已處理（接力用，手動啟動請留空）"
+        required: false
+        default: ""
+      handoff_fail_count:
+        description: "連續啟動失敗次數（自救接力用，手動啟動請留空）"
+        required: false
+        default: ""
 
+# 最小必要權限：
+#   contents: read  — checkout 與讀取 reports/
+#   actions: write  — 讓 bot 用 GITHUB_TOKEN 觸發下一棒（bot.yml）與每日報告（daily.yml）的 workflow_dispatch，
+#                     同時涵蓋查詢 run 狀態所需的讀取權限
 permissions:
   contents: read
+  actions: write
 
 # 全程只允許一個 bot 實例。多個實例會各自 poll getUpdates，同一則 /cb 可能被
 # 兩個實例同時取走並各跑一次抓取（還會讓同一組 Telegram session 從兩個 IP 同時連線而被撤銷）。
 #
 # cancel-in-progress: false —— 新班次「排隊等」，不砍掉執行中的：
 #   - 舊版 true 會在新班次一啟動就殺掉舊的，若剛好有人下指令、抓取做到一半就被中斷。
-#   - 排隊中的班次在舊的跑滿 5 小時結束後立刻接手，沒有空窗。
-#   - GitHub 同一 group 只保留最新的一個排隊，多出來的會顯示 cancelled，那是正常的。
+#   - 本棒會在結束前 15 分鐘就先觸發下一棒，它在這裡排隊；本棒一結束它立即接手（交接空窗只剩 runner 啟動時間）。
+#   - 這裡不做「兩棒同時輪詢」的重疊：同一個 token 同時有兩個 getUpdates 會互砍（409 Conflict），
+#     指令可能被處理兩次，session 也可能因多個 IP 同時使用被撤銷。重疊改成「後繼提前排隊」。
+#   - GitHub 同一 group 只保留最新的一個排隊，被取代的會顯示 cancelled，那是正常的（cron 與接力同時排隊時會發生）。
+#     不論最後留下的是哪一個，同一時間都只會有一個 bot 在跑。
 concurrency:
   group: telegram-bot-listener
   cancel-in-progress: false
@@ -39,10 +59,11 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: 📦 安裝套件
-        run: pip install -r requirements.txt
+      # PyPI 偶發失敗曾讓 bot 整個起不來（run 946），所以重試；最終失敗會明確 fail。
+      - name: 📦 安裝套件（含重試）
+        run: bash scripts/pip_install_retry.sh requirements.txt
 
-      - name: 🤖 啟動 Telegram Bot 監聽（最多 5 小時）
+      - name: 🤖 啟動 Telegram Bot 監聽（最多 5 小時，結束前自動接力）
         env:
           TZ: Asia/Taipei
           PYTHONIOENCODING: utf-8
@@ -52,7 +73,26 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
+          # 接力、觸發每日報告、查詢 run 狀態都用這個 token；權限由上方 permissions 決定。
           # 勿用 secrets.GITHUB_TOKEN（未設定會變空字串，覆寫掉 Runner 內建 token）
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # 接力一律回到預設分支的程式碼；萬一事件 payload 沒帶 default_branch 就退回 master
+          BOT_RELAY_REF: ${{ github.event.repository.default_branch || 'master' }}
+          # 交接資訊（接力啟動時由上一棒帶入；cron / 手動啟動為空）
+          BOT_PREV_RUN_ID: ${{ github.event.inputs.handoff_prev_run_id }}
+          BOT_MIN_UPDATE_ID: ${{ github.event.inputs.handoff_min_update_id }}
+          # 告警（接力最終失敗、觸發每日報告失敗）送到日報同一個聊天室；未設定則只寫 log
+          BOT_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot_listener.py
+
+      # 本棒在啟動階段就失敗（pip、checkout…）或 bot 結束時接力沒成功，就由這一步代為排下一棒。
+      # 只用標準函式庫，所以 pip 失敗時也能跑。有退避與連續失敗上限，不會無限自我重啟。
+      - name: 🔁 失敗自救：排下一棒
+        if: ${{ failure() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BOT_RELAY_REF: ${{ github.event.repository.default_branch || 'master' }}
+          BOT_FAIL_COUNT: ${{ github.event.inputs.handoff_fail_count }}
+        run: python3 bot_relay.py recover
