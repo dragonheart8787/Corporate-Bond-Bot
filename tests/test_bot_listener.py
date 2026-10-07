@@ -348,6 +348,36 @@ class TestMainRelay(MainHarness):
         self.assertEqual(dispatches, [])
 
 
+class TestDispatchRef(MainHarness):
+    def test_relay_dispatches_on_default_branch_not_the_current_github_ref(self):
+        env = {"BOT_RELAY_REF": "master", "GITHUB_REF_NAME": "feature/tmp", "GITHUB_REF": "refs/heads/feature/tmp"}
+        _, _, _, _, dispatches = self.run_main([[]], env_extra=env)
+        self.assertTrue(dispatches)
+        self.assertEqual({ref for _, ref, _ in dispatches}, {"master"})
+
+    def test_missing_relay_ref_falls_back_to_master_never_to_github_ref(self):
+        saved = os.environ.pop("BOT_RELAY_REF", None)
+        try:
+            _, out, _, _, dispatches = self.run_main([[]], env_extra={"GITHUB_REF_NAME": "feature/tmp"})
+        finally:
+            if saved is not None:
+                os.environ["BOT_RELAY_REF"] = saved
+        self.assertEqual({ref for _, ref, _ in dispatches}, {"master"})
+        self.assertIn("退回 master", out)
+
+    def test_daily_trigger_also_uses_default_branch(self):
+        import datetime as _dt
+        env = {"BOT_DAILY_TRIGGER": "1", "BOT_RELAY_ENABLED": "0", "BOT_RELAY_REF": "master", "GITHUB_REF_NAME": "feature/tmp"}
+        with mock.patch.object(relay, "read_last_sent", lambda *a, **k: ""), \
+                mock.patch.object(relay, "daily_run_active", lambda *a, **k: False), \
+                mock.patch.object(bl, "datetime", wraps=_dt.datetime) as dtm:
+            dtm.now.return_value = _dt.datetime(2026, 10, 7, 19, 0, tzinfo=bl.TW_ZONE)
+            _, _, _, _, dispatches = self.run_main([[]], env_extra=env)
+        daily = [d for d in dispatches if d[0] == "daily.yml"]
+        self.assertTrue(daily)
+        self.assertEqual({ref for _, ref, _ in daily}, {"master"})
+
+
 class TestMaxRuntimeInput(MainHarness):
     def test_startup_log_states_runtime_source_and_relay_lead(self):
         _, out, _, _, dispatches = self.run_main([[]])

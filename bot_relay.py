@@ -313,7 +313,24 @@ def daily_run_active(
     return any(r.get("status") in _ACTIVE_STATUSES for r in (data or {}).get("workflow_runs", []))
 
 
-_PENDING_STATUSES = {"queued", "pending", "waiting", "requested"}   # 不含 in_progress（那是本棒自己）
+# 排隊中、尚未開始的狀態。GitHub 被 concurrency 擋住的 run 是 pending，一般排隊是 queued，等核准／環境是 waiting。
+_PENDING_STATUSES = {"queued", "waiting", "pending", "requested"}   # 不含 in_progress（那是本棒自己）
+
+
+def default_ref(env: Optional[Dict[str, str]] = None) -> str:
+    """
+    所有 workflow_dispatch 的 ref 一律用預設分支（由 workflow 的 BOT_RELAY_REF 帶入，預設 master）。
+    絕不退回 GITHUB_REF_NAME / github.ref：那是「這個 run 被觸發時的分支」，從別的分支手動啟動時會是暫時值，
+    接力鏈就會跟著跑在那個分支上，之後分支一刪鏈就斷了。
+    """
+    env = dict(os.environ if env is None else env)
+    ref = (env.get("BOT_RELAY_REF") or "").strip()
+    if ref.startswith("refs/heads/"):
+        ref = ref[len("refs/heads/"):]
+    if not ref:
+        log("⚠️ 未提供 BOT_RELAY_REF，dispatch 的 ref 退回 master")
+        return "master"
+    return ref
 
 
 def pending_successor_exists(
@@ -644,7 +661,7 @@ def cmd_recover(
         dispatch_workflow(
             repo,
             "bot.yml",
-            env.get("BOT_RELAY_REF") or env.get("GITHUB_REF_NAME") or "master",
+            default_ref(env),
             # 只帶有值的欄位：沒有水位線可帶時不送空字串，避免對 API 做不必要的假設
             {
                 k: v
@@ -672,5 +689,8 @@ def cmd_recover(
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "recover":
         sys.exit(cmd_recover())
-    print("用法：python bot_relay.py recover", file=sys.stderr)
+    if len(sys.argv) > 2 and sys.argv[1] == "alert":
+        # 供 workflow 的 shell 步驟在最終失敗時告警：python bot_relay.py alert "訊息"（token / chat id 走環境變數）
+        sys.exit(0 if send_telegram_alert(sys.argv[2]) else 1)
+    print("用法：python bot_relay.py recover | alert <訊息>", file=sys.stderr)
     sys.exit(2)

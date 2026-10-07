@@ -655,7 +655,7 @@ def main() -> int:
     event = os.environ.get("GITHUB_EVENT_NAME", "local")
     prev_run_id = os.environ.get("BOT_PREV_RUN_ID", "").strip()
     min_update_id = _int_env("BOT_MIN_UPDATE_ID", 0)
-    relay_ref = os.environ.get("BOT_RELAY_REF") or os.environ.get("GITHUB_REF_NAME") or "master"
+    relay_ref = relay.default_ref()   # 預設分支；不跟著觸發當下的 github.ref 走
     dry_run = os.environ.get("BOT_RELAY_DRY_RUN", "") == "1"
 
     relay_enabled = os.environ.get("BOT_RELAY_ENABLED", "1") != "0"

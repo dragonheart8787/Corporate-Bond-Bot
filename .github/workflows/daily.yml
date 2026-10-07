@@ -126,10 +126,21 @@ jobs:
             echo "::warning::排程延遲已跨過台北午夜，報告日期回退為 ${RD}"
           fi
 
+      # 防重發守門放在「抓取之前」：已送過的日報不該再連線 Telegram 抓一遍
+      # （多一次連線就多一次 session 被撤銷的風險，也浪費 Actions 分鐘數）。
+      # 這時已經過了 concurrency 排隊與「分支最新」的 checkout，所以讀到的 .last_sent 是最新的。
+      # 判斷邏輯在 main.py check-sent；send 步驟內的同一個判斷仍保留當第二道防線。
+      - name: 🛡️ 防重發守門（已送過就略過抓取與發送）
+        id: guard
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        env:
+          SKIP_IF_ALREADY_SENT: ${{ github.event_name == 'schedule' || github.event.inputs.skip_if_sent == 'true' }}
+        run: python main.py check-sent
+
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
         id: fetch
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send')) }}
         continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -149,7 +160,7 @@ jobs:
           python main.py fetch
 
       - name: 💾 儲存報告至 reports/
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send')) }}
         run: |
           mkdir -p reports
           REPORT="outputs/daily/complete_report_${REPORT_DATE}.txt"
@@ -162,7 +173,7 @@ jobs:
 
       # 先發送再 git push：避免 push 網路延遲／重試卡住 Telegram 10～20+ 分鐘（send 讀 runner 上檔案即可）
       - name: 🔍 發送前檢查報告檔
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch')) }}
         run: |
           ls -la reports/ 2>/dev/null || echo "（無 reports 目錄）"
           ls -la outputs/daily/ 2>/dev/null || echo "（無 outputs/daily）"
@@ -174,7 +185,7 @@ jobs:
 
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
         id: send
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch')) }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -201,6 +212,10 @@ jobs:
       # 否則備援排程的防重發標記永遠不會被提交。
       - name: 📝 Commit 報告到 GitHub
         if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          # 最終推送失敗時的 Telegram 告警（只在最終失敗才會送）；未設定則只有 ::error::
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -210,17 +225,8 @@ jobs:
             exit 0
           fi
           git commit -m "update: 每日報告 ${REPORT_DATE:-$(date '+%Y-%m-%d')}"
-          # 備援排程與主排程可能接連跑，push 前先 rebase，避免標記因 non-fast-forward 掉失
-          for i in 1 2 3; do
-            if git push; then
-              echo "✅ push 成功"
-              exit 0
-            fi
-            echo "push 失敗，pull --rebase 後重試 ($i/3)"
-            git pull --rebase origin master || true
-            sleep $((i * 3))
-          done
-          echo "::warning::git push 最終失敗（Telegram 已送出，但 .last_sent 未入庫，備援可能重發）"
+          # 每次嘗試前 pull --rebase、失敗退避重試；最終失敗 → ::error:: + Telegram 告警 + 此步驟失敗（run 變紅）
+          bash scripts/push_with_retry.sh
 
       # 不論前面成功或失敗都輸出：這一次實際「產生」與「送出」的是哪一天的報告、結果如何。
       # 送出結果讀 main.py 寫的 send_result.txt（sent / skipped_already_sent / failed），不靠推測。

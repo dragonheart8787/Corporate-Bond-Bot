@@ -304,6 +304,35 @@ def _is_empty_result(content: str) -> bool:
 # ─────────────────────────────────────────
 # MODE: send — 讀取 complete_report 並傳送
 # ─────────────────────────────────────────
+def skip_if_already_sent(target_date: str) -> bool:
+    """SKIP_IF_ALREADY_SENT 開啟且該日已成功送出則回 True（並寫送出結果檔）。fetch 與 send 之前都要先問它。"""
+    if _truthy("SKIP_IF_ALREADY_SENT") and already_sent(target_date):
+        safe_print(f"✅ {target_date} 的報告先前已成功發送（{SENT_MARKER}），略過本次抓取與發送")
+        record_send_result(target_date, "skipped_already_sent")
+        return True
+    return False
+
+
+def mode_check_sent() -> None:
+    """
+    供 daily.yml 在「抓取之前」呼叫：已送過就讓後續的 fetch / 存檔 / send 步驟整個略過。
+    結果寫進 $GITHUB_OUTPUT 的 skip=true|false；在 Actions 內寫不進去就明確失敗，不能默默當成 false。
+    """
+    target_date = today_str()
+    skip = skip_if_already_sent(target_date)
+    if not skip:
+        safe_print(f"ℹ️ {target_date} 尚未送出（或未啟用防重發），繼續抓取與發送")
+    out = os.environ.get("GITHUB_OUTPUT", "")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:   # 寫失敗會丟例外 → 步驟失敗 → 後續步驟因 success() 隱含條件被略過（fail-closed）
+            f.write(f"skip={'true' if skip else 'false'}\n")
+    elif os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        safe_print("❌ 在 Actions 內卻沒有 GITHUB_OUTPUT，無法把守門結果交給後續步驟")
+        sys.exit(1)
+    else:
+        safe_print(f"skip={'true' if skip else 'false'}（非 Actions 環境，未寫 GITHUB_OUTPUT）")
+
+
 def mode_send() -> None:
     safe_print("\n" + "=" * 55)
     safe_print(f"📤 [SEND] {datetime.now(_TWZ).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
@@ -322,9 +351,7 @@ def mode_send() -> None:
         )
 
     # 備援排程用：若這一天已經成功發送過，就不要再送一次
-    if _truthy("SKIP_IF_ALREADY_SENT") and already_sent(target_date):
-        safe_print(f"✅ {target_date} 的報告先前已成功發送（{SENT_MARKER}），略過本次發送")
-        record_send_result(target_date, "skipped_already_sent")
+    if skip_if_already_sent(target_date):
         return
 
     bot_token, chat_id = load_bot_credentials()
@@ -427,7 +454,12 @@ def main() -> None:
             sys.exit(1)
     elif mode == "send":
         mode_send()
+    elif mode == "check-sent":
+        mode_check_sent()
     elif mode == "all":
+        # 已送過就連抓取都不做（fetch 會連線 Telegram）
+        if skip_if_already_sent(today_str()):
+            return
         ok = mode_fetch()
         safe_print("\n▶ 直接發送（all 模式）")
         mode_send()          # 抓取失敗仍嘗試發送（可能用 repo 內備份報告）
@@ -437,7 +469,7 @@ def main() -> None:
         # 供 workflow 解析一次日期後傳給所有步驟（見 daily.yml）
         print(today_str())
     else:
-        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all / report-date）")
+        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all / report-date / check-sent）")
         sys.exit(1)
 
 

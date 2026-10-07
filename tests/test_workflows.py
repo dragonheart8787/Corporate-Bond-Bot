@@ -99,6 +99,18 @@ class TestBotWorkflow(unittest.TestCase):
         code = read("bot_listener.py") + read("bot_relay.py")
         self.assertNotRegex(code, r'"max_runtime_minutes"\s*:')
 
+    def test_every_dispatch_ref_comes_from_default_branch_not_github_ref(self):
+        text = read(".github/workflows/bot.yml")
+        refs = re.findall(r"BOT_RELAY_REF: (.*)", text)
+        self.assertEqual(len(refs), 2)            # bot 步驟與自救步驟
+        for expr in refs:
+            self.assertEqual(expr.strip(), "${{ github.event.repository.default_branch || 'master' }}")
+        self.assertNotRegex(text, r"BOT_RELAY_REF:.*github\.ref")
+        for name in ("bot_listener.py", "bot_relay.py"):
+            # 只檢查「讀取」（註解與說明文字可以提到它）
+            self.assertNotRegex(read(name), r"""(environ|env)\.get\(\s*["']GITHUB_(REF|HEAD_REF)""", name)
+            self.assertNotRegex(read(name), r"""(environ|env)\[\s*["']GITHUB_(REF|HEAD_REF)""", name)
+
     def test_daily_and_bot_concurrency_groups_are_separate_and_never_cancel_running(self):
         daily = load("daily.yml")["jobs"]["fetch-and-send"]["concurrency"]
         self.assertTrue(daily["group"].startswith("corporate-bond-daily"))
@@ -162,6 +174,47 @@ class TestDailyWorkflow(unittest.TestCase):
         self.assertNotIn("last_sent", str(steps[send].get("if", "")))
         main_src = read("main.py")
         self.assertRegex(main_src, r'_truthy\("SKIP_IF_ALREADY_SENT"\) and already_sent\(target_date\)')
+
+    def _daily_steps(self):
+        return self.wf["jobs"]["fetch-and-send"]["steps"]
+
+    def test_guard_runs_before_fetch_and_every_telegram_or_report_step_depends_on_it(self):
+        steps = self._daily_steps()
+        ids = [s.get("id") for s in steps]
+        self.assertLess(ids.index("guard"), ids.index("fetch"))
+        self.assertLess(ids.index("guard"), ids.index("send"))
+        guard = steps[ids.index("guard")]
+        self.assertEqual(guard["run"].strip(), "python main.py check-sent")
+        self.assertIn("github.event.inputs.skip_if_sent == 'true'", guard["env"]["SKIP_IF_ALREADY_SENT"])
+        self.assertIn("github.event_name == 'schedule'", guard["env"]["SKIP_IF_ALREADY_SENT"])
+        self.assertNotIn("continue-on-error", guard)        # 守門失敗不得被吞掉
+        for s in steps:
+            if s.get("id") in ("fetch", "send") or "儲存報告" in s["name"] or "發送前檢查" in s["name"]:
+                self.assertIn("steps.guard.outputs.skip != 'true'", s["if"], s["name"])
+
+    def test_guard_is_after_checkout_and_install_but_before_any_telegram_connection(self):
+        steps = self._daily_steps()
+        names = [s["name"] for s in steps]
+        g = [i for i, s in enumerate(steps) if s.get("id") == "guard"][0]
+        self.assertLess([i for i, s in enumerate(steps) if "actions/checkout" in str(s.get("uses"))][0], g)
+        self.assertLess([i for i, s in enumerate(steps) if "pip_install_retry" in s.get("run", "")][0], g)
+        for i, s in enumerate(steps):
+            if "TELEGRAM_SESSION_STRING" in str(s.get("env", {})):
+                self.assertGreater(i, g, f"{names[i]} 會用到 Telegram session，必須在守門之後")
+
+    def test_push_uses_retry_script_and_failure_is_not_just_a_warning(self):
+        steps = self._daily_steps()
+        commit = [s for s in steps if "Commit 報告" in s["name"]][0]
+        self.assertIn("bash scripts/push_with_retry.sh", commit["run"])
+        self.assertNotRegex(commit["run"], r"(?m)^\s*git push\b")
+        self.assertNotIn("continue-on-error", commit)
+        self.assertIn("secrets.TELEGRAM_BOT_TOKEN", commit["env"]["TELEGRAM_BOT_TOKEN"])
+        self.assertIn("secrets.TELEGRAM_CHAT_ID", commit["env"]["BOT_ALERT_CHAT_ID"])
+        script = read("scripts/push_with_retry.sh")
+        self.assertIn("pull --rebase", script)
+        self.assertIn("::error", script)
+        self.assertRegex(script, r"(?m)^exit 1$")
+        self.assertNotIn("origin master", script)      # 不寫死分支
 
     def test_summary_step_always_runs(self):
         steps = self.wf["jobs"]["fetch-and-send"]["steps"]

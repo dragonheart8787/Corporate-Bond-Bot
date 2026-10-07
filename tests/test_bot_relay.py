@@ -541,6 +541,59 @@ class TestPendingSuccessor(unittest.TestCase):
         self.assertIn("/repos/o/r/actions/workflows/bot.yml/runs", op.calls[0].full_url)
 
 
+class TestPendingStatusCoverage(unittest.TestCase):
+    """排隊中的三種狀態各自都要被認出來，否則自救會把使用者排好的 run 取代掉。"""
+
+    def check(self, status):
+        op = routed_opener(runs=[(9, status)])
+        return relay.pending_successor_exists("o/r", FAKE_GH_TOKEN, "1", opener=op)
+
+    def test_queued_counts(self):
+        self.assertTrue(self.check("queued"))
+
+    def test_waiting_counts(self):
+        self.assertTrue(self.check("waiting"))
+
+    def test_pending_counts(self):
+        self.assertTrue(self.check("pending"))
+
+    def test_status_set_contains_all_three(self):
+        self.assertTrue({"queued", "waiting", "pending"} <= relay._PENDING_STATUSES)
+        self.assertNotIn("in_progress", relay._PENDING_STATUSES)
+
+    def test_query_has_no_status_filter_that_could_hide_pending_runs(self):
+        op = routed_opener(runs=[])
+        relay.pending_successor_exists("o/r", FAKE_GH_TOKEN, "1", opener=op)
+        self.assertNotIn("status=", op.calls[0].full_url)
+
+
+class TestDispatchRefIsDefaultBranch(unittest.TestCase):
+    def test_default_ref_uses_relay_ref_only(self):
+        self.assertEqual(relay.default_ref({"BOT_RELAY_REF": "master"}), "master")
+        self.assertEqual(relay.default_ref({"BOT_RELAY_REF": "refs/heads/main"}), "main")
+
+    def test_default_ref_ignores_temporary_github_ref_values(self):
+        env = {"GITHUB_REF_NAME": "feature/tmp", "GITHUB_REF": "refs/heads/feature/tmp", "GITHUB_HEAD_REF": "feature/tmp"}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(relay.default_ref(env), "master")
+        self.assertIn("退回 master", out.getvalue())          # 退回時有 log，不是靜默
+
+    def test_recover_dispatches_on_default_branch_even_when_run_is_on_a_feature_branch(self):
+        op = routed_opener()
+        env = {"GITHUB_REPOSITORY": "o/r", "GITHUB_TOKEN": FAKE_GH_TOKEN, "GITHUB_RUN_ID": "5",
+               "BOT_RELAY_REF": "master", "GITHUB_REF_NAME": "feature/tmp", "GITHUB_REF": "refs/heads/feature/tmp"}
+        code, _ = capture(relay.cmd_recover, env, sleep=lambda s: None, opener=op)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(op.posts()[0].data)["ref"], "master")
+
+    def test_recover_without_relay_ref_falls_back_to_master_not_current_ref(self):
+        op = routed_opener()
+        env = {"GITHUB_REPOSITORY": "o/r", "GITHUB_TOKEN": FAKE_GH_TOKEN, "GITHUB_RUN_ID": "5", "GITHUB_REF_NAME": "feature/tmp"}
+        capture(relay.cmd_recover, env, sleep=lambda s: None, opener=op)
+        self.assertEqual(json.loads(op.posts()[0].data)["ref"], "master")
+
+
 class TestResolveRuntime(unittest.TestCase):
     def resolve(self, **env):
         return relay.resolve_runtime(env)
