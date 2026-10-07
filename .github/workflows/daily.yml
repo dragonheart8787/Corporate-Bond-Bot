@@ -72,8 +72,22 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - name: 📥 Checkout 程式碼
+      # 明確 checkout 分支最新 commit，而不是預設的「觸發當下的 github.sha」：
+      # 這個 run 可能在 concurrency 佇列裡等很久，等到時 reports/.last_sent 早被前一個 run 更新了。
+      # 用舊的 sha 會讓 SKIP_IF_ALREADY_SENT 讀到過期標記而重發日報。
+      - name: 📥 Checkout 程式碼（分支最新）
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: 📌 Checkout 版本與防重發標記
+        run: |
+          echo "trigger_sha=${GITHUB_SHA}"
+          echo "checkout_head=$(git rev-parse HEAD)"
+          if [ "${GITHUB_SHA}" != "$(git rev-parse HEAD)" ]; then
+            echo "::notice::排隊期間分支已前進：本次使用較新的 checkout（防重發標記以最新為準）"
+          fi
+          echo ".last_sent=$(cat reports/.last_sent 2>/dev/null || echo '(無)')"
 
       - name: 🔎 觸發來源與時間（除錯「一直自動發送」必看）
         run: |

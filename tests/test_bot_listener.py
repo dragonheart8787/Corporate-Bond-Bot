@@ -222,16 +222,27 @@ class TestWaitForDailyIdle(unittest.TestCase):
         self.assertEqual(sleeps, [10, 10])
         self.assertIn("每日報告正在執行", out)
 
-    def test_gives_up_waiting_after_max_wait_but_still_proceeds_with_warning(self):
+    def test_timeout_is_fail_closed_returns_false_with_log(self):
         ok, n, sleeps, out = self.run_wait([True], max_wait=30)
-        self.assertFalse(ok)
+        self.assertFalse(ok)                       # False = 不可抓取
         self.assertEqual(sum(sleeps), 30)
-        self.assertIn("不再等待", out)
+        self.assertIn("略過即時抓取", out)
 
-    def test_api_error_is_logged_and_does_not_block_the_command(self):
-        ok, n, _, out = self.run_wait([relay.GitHubApiError(500, "down")])
+    def test_default_max_wait_is_120_seconds(self):
+        self.assertEqual(bl.DAILY_IDLE_MAX_WAIT_SEC, 120)
+
+    def test_persistent_api_error_is_fail_closed_after_retries(self):
+        ok, n, sleeps, out = self.run_wait([relay.GitHubApiError(500, "down")])
         self.assertFalse(ok)
-        self.assertEqual(n, 1)
+        self.assertEqual(n, bl.DAILY_IDLE_API_RETRIES)
+        self.assertEqual(sleeps, [bl.DAILY_IDLE_API_RETRY_SEC] * (bl.DAILY_IDLE_API_RETRIES - 1))
+        self.assertIn("無法確認每日報告", out)
+        self.assertIn("略過即時抓取", out)
+
+    def test_transient_api_error_then_idle_proceeds(self):
+        ok, n, _, out = self.run_wait([relay.GitHubApiError(502, "blip"), False])
+        self.assertTrue(ok)
+        self.assertEqual(n, 2)
         self.assertIn("無法確認每日報告", out)
 
     def test_no_token_or_daily_trigger_disabled_skips_the_check(self):
@@ -281,8 +292,6 @@ class MainHarness(unittest.TestCase):
                 mock.patch.object(bl, "get_report_updated_time", lambda *a: "測試"), \
                 mock.patch.object(relay, "dispatch_workflow", fake_dispatch), \
                 mock.patch.object(relay, "fetch_prev_run_info", lambda *a, **k: prev_info), \
-                mock.patch.object(bl, "MAX_RUNTIME_SEC", int(env["BOT_MAX_RUNTIME_SEC"])), \
-                mock.patch.object(bl, "RELAY_LEAD_SEC", int(env["BOT_RELAY_LEAD_SEC"])), \
                 mock.patch.object(bl, "IDLE_SLEEP_SEC", 0), \
                 mock.patch.object(bl.time, "sleep", lambda s: real_sleep(min(s, 0.02))), \
                 contextlib.redirect_stdout(out):
@@ -337,6 +346,58 @@ class TestMainRelay(MainHarness):
         code, out, _, _, dispatches = self.run_main([[]], env_extra={"BOT_RELAY_ENABLED": "0"})
         self.assertEqual(code, 0)
         self.assertEqual(dispatches, [])
+
+
+class TestMaxRuntimeInput(MainHarness):
+    def test_startup_log_states_runtime_source_and_relay_lead(self):
+        _, out, _, _, dispatches = self.run_main([[]])
+        self.assertIn("運行時間：0 分鐘", out)          # 測試用 2 秒
+        self.assertIn("BOT_MAX_RUNTIME_SEC=2", out)
+        self.assertIn("接力提前量 1 秒", out)
+        self.assertEqual(len(dispatches), 1)
+
+    def test_minutes_input_wins_over_seconds_and_is_reported(self):
+        # resolve_runtime 的細節在 test_bot_relay；這裡確認 main() 真的用它（15 分鐘 → 接力點第 10 分鐘）
+        seen = {}
+        real = relay.resolve_runtime
+
+        def spy(env=None):
+            res = real(env)
+            seen["res"] = res
+            return 2, 1, res[2]      # 實際只跑 2 秒，其餘照真實解析結果
+
+        with mock.patch.object(relay, "resolve_runtime", spy):
+            _, out, _, _, _ = self.run_main([[]], env_extra={"BOT_MAX_RUNTIME_MINUTES": "15", "BOT_RELAY_LEAD_SEC": "900"})
+        self.assertEqual(seen["res"][:2], (900, 300))
+        self.assertIn("max_runtime_minutes=15（手動指定）", out)
+
+
+class TestReportCommandFailClosed(unittest.TestCase):
+    """日報在跑（或查不到）時，/cb 不可去抓；要明確告知使用者並改讀已存檔報告。"""
+
+    def run_cmd(self, idle):
+        sent, fetched = [], []
+        with mock.patch.object(bl, "wait_for_daily_idle", lambda *a, **k: idle), \
+                mock.patch.object(bl, "can_run_fetch", lambda: True), \
+                mock.patch.object(bl, "run_fetch_subprocess", lambda: fetched.append(1) or 0), \
+                mock.patch.object(bl, "send_message", lambda tok, chat, text: sent.append(text) or True), \
+                mock.patch.object(bl, "load_report_text", lambda *a: ("📊 測試報告 轉換公司債", "github")), \
+                mock.patch.object(bl, "staleness_note", lambda *a: ""), \
+                mock.patch.object(bl, "PRE_FETCH_DELAY_SEC", 0), mock.patch.object(bl, "POST_FETCH_DELAY_SEC", 0), \
+                mock.patch.object(bl.time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+            bl.handle_report_command(FAKE_BOT_TOKEN, "1", FAKE_GH_TOKEN, "o/r", "all")
+        return sent, fetched
+
+    def test_busy_skips_fetch_tells_user_and_still_replies_with_stored_report(self):
+        sent, fetched = self.run_cmd(idle=False)
+        self.assertEqual(fetched, [])
+        self.assertTrue(any("這次不即時抓取" in t for t in sent))
+        self.assertTrue(any("測試報告" in t for t in sent))
+
+    def test_idle_fetches(self):
+        sent, fetched = self.run_cmd(idle=True)
+        self.assertEqual(fetched, [1])
+        self.assertFalse(any("這次不即時抓取" in t for t in sent))
 
 
 class TestMainDedupeAndStartup(MainHarness):

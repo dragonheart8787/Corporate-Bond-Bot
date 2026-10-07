@@ -386,8 +386,38 @@ class TestDailyTrigger(unittest.TestCase):
         self.assertEqual(self.tick(self.dt(19), now_ts=2001)[0], "dispatched")
 
 
+def runs_body(*runs):
+    return json.dumps({"workflow_runs": [{"id": i, "status": st} for i, st in runs]}).encode()
+
+
+def routed_opener(*, runs=None, get_error=None, post=None, telegram=None):
+    """GET .../runs 回 runs；POST dispatches 回 post（預設 204）；Telegram 回 telegram（預設 200）。記錄所有請求。"""
+    calls = []
+
+    def opener(req, timeout=None):
+        calls.append(req)
+        url, method = req.full_url, req.get_method()
+        if "api.telegram.org" in url:
+            r = telegram if telegram is not None else FakeResp(200, b"{}")
+        elif method == "GET":
+            if get_error is not None:
+                raise get_error
+            r = FakeResp(200, runs_body(*(runs or [])))
+        else:
+            r = post if post is not None else FakeResp(204)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    opener.calls = calls
+    opener.posts = lambda: [c for c in calls if c.get_method() == "POST" and "dispatches" in c.full_url]
+    opener.telegrams = lambda: [c for c in calls if "api.telegram.org" in c.full_url]
+    return opener
+
+
 class TestRecover(unittest.TestCase):
     ENV = {"GITHUB_REPOSITORY": "o/r", "GITHUB_TOKEN": FAKE_GH_TOKEN, "GITHUB_RUN_ID": "55", "BOT_RELAY_REF": "master"}
+    ALERT = {"TELEGRAM_BOT_TOKEN": FAKE_BOT_TOKEN, "BOT_ALERT_CHAT_ID": "424242"}
 
     def run_recover(self, env, opener):
         sleeps = []
@@ -395,45 +425,223 @@ class TestRecover(unittest.TestCase):
         return code, out, sleeps
 
     def test_first_failure_backs_off_60s_and_dispatches_with_incremented_count(self):
-        op = make_opener(FakeResp(204))
+        op = routed_opener()
         code, out, sleeps = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": ""}, op)
         self.assertEqual(code, 0)
         self.assertEqual(sleeps[0], 60)
-        body = json.loads(op.calls[0].data)
+        body = json.loads(op.posts()[0].data)
         self.assertEqual(body["inputs"]["handoff_fail_count"], "1")
         self.assertEqual(body["inputs"]["handoff_prev_run_id"], "55")
 
     def test_backoff_grows_with_consecutive_failures(self):
-        op = make_opener(FakeResp(204))
-        _, _, sleeps = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "2"}, op)
-        self.assertEqual(sleeps[0], 240)
-        self.assertEqual(json.loads(op.calls[0].data)["inputs"]["handoff_fail_count"], "3")
+        for count, delay in (("0", 60), ("1", 120), ("2", 240), ("3", 480)):
+            op = routed_opener()
+            _, _, sleeps = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": count}, op)
+            self.assertEqual(sleeps[0], delay)
+            self.assertEqual(json.loads(op.posts()[0].data)["inputs"]["handoff_fail_count"], str(int(count) + 1))
 
     def test_recover_sends_only_non_empty_inputs(self):
-        op = make_opener(FakeResp(204))
+        op = routed_opener()
         self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, op)
-        inputs = json.loads(op.calls[0].data)["inputs"]
+        inputs = json.loads(op.posts()[0].data)["inputs"]
         self.assertNotIn("handoff_min_update_id", inputs)
         self.assertEqual(set(inputs), {"handoff_prev_run_id", "handoff_fail_count"})
 
-    def test_stops_after_max_consecutive_failures(self):
-        op = make_opener(FakeResp(204))
-        code, out, sleeps = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": str(relay.MAX_CONSECUTIVE_START_FAILURES)}, op)
+    def test_stops_after_max_consecutive_failures_and_alerts(self):
+        op = routed_opener()
+        code, out, sleeps = self.run_recover(
+            {**self.ENV, **self.ALERT, "BOT_FAIL_COUNT": str(relay.MAX_CONSECUTIVE_START_FAILURES)}, op)
         self.assertEqual(code, 1)
-        self.assertEqual(op.calls, [])
+        self.assertEqual(op.posts(), [])
+        self.assertEqual(sleeps, [])                 # 到上限不再睡、不再打 API
         self.assertIn("::error", out)
+        self.assertEqual(len(op.telegrams()), 1)     # 有送告警
+        self.assertNotIn(FAKE_BOT_TOKEN, out)
+        self.assertNotIn("424242", out)
 
-    def test_dispatch_failure_returns_nonzero_with_error(self):
-        code, out, _ = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, make_opener(http_error(403)))
+    def test_cap_is_four_so_at_most_five_consecutive_runs(self):
+        self.assertEqual(relay.MAX_CONSECUTIVE_START_FAILURES, 4)
+
+    def test_dispatch_failure_returns_nonzero_with_error_and_alerts(self):
+        op = routed_opener(post=http_error(403))
+        code, out, _ = self.run_recover({**self.ENV, **self.ALERT, "BOT_FAIL_COUNT": "0"}, op)
         self.assertEqual(code, 1)
         self.assertIn("::error", out)
         self.assertNotIn(FAKE_GH_TOKEN, out)
+        self.assertEqual(len(op.telegrams()), 1)
+
+    def test_alert_failure_is_logged_not_raised(self):
+        op = routed_opener(post=http_error(403), telegram=urllib.error.URLError("dns"))
+        code, out, _ = self.run_recover({**self.ENV, **self.ALERT, "BOT_FAIL_COUNT": "0"}, op)
+        self.assertEqual(code, 1)
+        self.assertIn("Telegram 告警送出失敗", out)
+        self.assertNotIn("424242", out)
+
+    def test_no_alert_credentials_only_logs(self):
+        op = routed_opener(post=http_error(403))
+        code, out, _ = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, op)
+        self.assertEqual(code, 1)
+        self.assertEqual(op.telegrams(), [])
+        self.assertIn("告警只寫入 log", out)
 
     def test_dry_run_sends_nothing(self):
-        op = make_opener(FakeResp(204))
+        op = routed_opener()
         code, _, _ = self.run_recover({**self.ENV, "BOT_RELAY_DRY_RUN": "1"}, op)
         self.assertEqual(code, 0)
         self.assertEqual(op.calls, [])
+
+    # ── 取消 / 逾時路徑 ──
+    def test_cancelled_job_still_recovers_with_short_backoff(self):
+        for count, delay in (("", 15), ("1", 30), ("2", 45), ("3", 60)):
+            op = routed_opener()
+            code, out, sleeps = self.run_recover({**self.ENV, "BOT_JOB_STATUS": "cancelled", "BOT_FAIL_COUNT": count}, op)
+            self.assertEqual(code, 0)
+            self.assertEqual(sleeps[0], delay)
+            self.assertEqual(len(op.posts()), 1)
+            self.assertIn("被取消或逾時", out)
+
+    def test_cancelled_counts_toward_cap(self):
+        op = routed_opener()
+        code, out, _ = self.run_recover({**self.ENV, **self.ALERT, "BOT_JOB_STATUS": "cancelled", "BOT_FAIL_COUNT": "4"}, op)
+        self.assertEqual(code, 1)
+        self.assertEqual(op.posts(), [])
+        self.assertEqual(len(op.telegrams()), 1)
+
+    # ── 已有後繼就不重複排 ──
+    def test_existing_pending_successor_is_not_replaced(self):
+        op = routed_opener(runs=[(55, "in_progress"), (56, "pending")])
+        code, out, _ = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, op)
+        self.assertEqual(code, 0)
+        self.assertEqual(op.posts(), [])
+        self.assertIn("已有排隊中的後繼", out)
+
+    def test_own_run_and_finished_runs_do_not_count_as_successor(self):
+        op = routed_opener(runs=[(55, "queued"), (50, "completed"), (49, "in_progress")])
+        code, _, _ = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, op)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(op.posts()), 1)
+
+    def test_successor_lookup_failure_still_dispatches(self):
+        op = routed_opener(get_error=http_error(500))
+        code, out, _ = self.run_recover({**self.ENV, "BOT_FAIL_COUNT": "0"}, op)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(op.posts()), 1)
+        self.assertIn("無法確認是否已有後繼 run", out)
+
+
+class TestPendingSuccessor(unittest.TestCase):
+    def test_statuses(self):
+        for st, expected in (("pending", True), ("queued", True), ("waiting", True), ("in_progress", False), ("completed", False)):
+            op = routed_opener(runs=[(9, st)])
+            self.assertIs(relay.pending_successor_exists("o/r", FAKE_GH_TOKEN, "1", opener=op), expected, st)
+
+    def test_queries_bot_yml_runs_endpoint(self):
+        op = routed_opener(runs=[])
+        relay.pending_successor_exists("o/r", FAKE_GH_TOKEN, "1", opener=op)
+        self.assertIn("/repos/o/r/actions/workflows/bot.yml/runs", op.calls[0].full_url)
+
+
+class TestResolveRuntime(unittest.TestCase):
+    def resolve(self, **env):
+        return relay.resolve_runtime(env)
+
+    def test_default_is_300_minutes_with_relay_at_285(self):
+        sec, lead, note = self.resolve()
+        self.assertEqual((sec, lead), (300 * 60, 900))
+        self.assertEqual((sec - lead) // 60, 285)
+        self.assertIn("預設", note)
+
+    def test_empty_input_is_default(self):
+        self.assertEqual(self.resolve(BOT_MAX_RUNTIME_MINUTES="  ")[0], 300 * 60)
+
+    def test_manual_15_and_20_minutes_scale_the_lead(self):
+        sec, lead, note = self.resolve(BOT_MAX_RUNTIME_MINUTES="15")
+        self.assertEqual((sec, lead), (900, 300))        # 第 10 分鐘就先排後繼
+        self.assertIn("手動指定", note)
+        sec, lead, _ = self.resolve(BOT_MAX_RUNTIME_MINUTES="20")
+        self.assertEqual((sec, lead), (1200, 400))
+
+    def test_out_of_range_is_clamped_with_warning(self):
+        sec, _, note = self.resolve(BOT_MAX_RUNTIME_MINUTES="1")
+        self.assertEqual(sec, 5 * 60)
+        self.assertIn("⚠️", note)
+        sec, _, note = self.resolve(BOT_MAX_RUNTIME_MINUTES="9999")
+        self.assertEqual(sec, 300 * 60)
+        self.assertIn("⚠️", note)
+        sec, _, note = self.resolve(BOT_MAX_RUNTIME_MINUTES="-5")
+        self.assertEqual(sec, 5 * 60)
+
+    def test_garbage_falls_back_to_default_with_warning(self):
+        sec, _, note = self.resolve(BOT_MAX_RUNTIME_MINUTES="abc")
+        self.assertEqual(sec, 300 * 60)
+        self.assertIn("不是整數", note)
+
+    def test_minutes_takes_precedence_over_seconds_env(self):
+        self.assertEqual(self.resolve(BOT_MAX_RUNTIME_MINUTES="15", BOT_MAX_RUNTIME_SEC="2")[0], 900)
+
+    def test_seconds_env_still_works_for_tests(self):
+        sec, lead, _ = self.resolve(BOT_MAX_RUNTIME_SEC="2", BOT_RELAY_LEAD_SEC="1")
+        self.assertEqual((sec, lead), (2, 1))
+
+    def test_lead_never_exceeds_a_third_of_runtime_nor_configured_value(self):
+        self.assertEqual(self.resolve(BOT_MAX_RUNTIME_MINUTES="300", BOT_RELAY_LEAD_SEC="60")[1], 60)
+        self.assertEqual(self.resolve(BOT_MAX_RUNTIME_MINUTES="5", BOT_RELAY_LEAD_SEC="900")[1], 100)
+
+
+class TestTelegramAlert(unittest.TestCase):
+    def test_posts_to_bot_api_without_logging_secrets(self):
+        op = routed_opener()
+        ok, out = capture(relay.send_telegram_alert, "壞了", {"TELEGRAM_BOT_TOKEN": FAKE_BOT_TOKEN, "BOT_ALERT_CHAT_ID": "424242"}, opener=op)
+        self.assertTrue(ok)
+        self.assertEqual(len(op.telegrams()), 1)
+        self.assertIn("/sendMessage", op.calls[0].full_url)
+        self.assertIn("壞了", json.loads(op.calls[0].data)["text"])
+        self.assertNotIn(FAKE_BOT_TOKEN, out)
+        self.assertNotIn("424242", out)
+
+    def test_missing_config_makes_no_request(self):
+        op = routed_opener()
+        ok, out = capture(relay.send_telegram_alert, "x", {"TELEGRAM_BOT_TOKEN": FAKE_BOT_TOKEN}, opener=op)
+        self.assertFalse(ok)
+        self.assertEqual(op.calls, [])
+
+    def test_http_error_and_non_2xx_return_false_and_log(self):
+        for op in (routed_opener(telegram=http_error(400)), routed_opener(telegram=FakeResp(500))):
+            ok, out = capture(relay.send_telegram_alert, "x", {"TELEGRAM_BOT_TOKEN": FAKE_BOT_TOKEN, "BOT_ALERT_CHAT_ID": "424242"}, opener=op)
+            self.assertFalse(ok)
+            self.assertIn("告警", out)
+            self.assertNotIn(FAKE_BOT_TOKEN, out)
+
+
+class TestDailyHoldCap(unittest.TestCase):
+    def test_hold_extends_but_is_capped_per_window(self):
+        t = relay.DailyTrigger()
+        capture(t.hold, 1000.0, 120, 600)
+        self.assertEqual(t.hold_until_ts, 1120.0)
+        # 反覆下指令：每次延長，但從第一輪開始算 600 秒封頂
+        for now in (1100.0, 1200.0, 1300.0, 1400.0, 1500.0, 1590.0):
+            capture(t.hold, now, 120, 600)
+        self.assertEqual(t.hold_until_ts, 1600.0)
+        _, out = capture(t.hold, 1595.0, 120, 600)
+        self.assertEqual(t.hold_until_ts, 1600.0)
+        self.assertIn("上限", out)
+
+    def test_released_at_cap_even_with_continuous_commands(self):
+        t = relay.DailyTrigger(check_interval_sec=0)
+        capture(t.hold, 1000.0, 120, 600)
+        for now in (1100.0, 1200.0, 1300.0, 1400.0, 1500.0, 1590.0):
+            capture(t.hold, now, 120, 600)
+        dt = datetime(2026, 10, 7, 19, 0, tzinfo=TW)
+        act, _ = t.tick(1599.0, dt, read_sent=lambda: "", run_active=lambda: False, dispatch=lambda: None)
+        self.assertEqual(act, "holding")
+        act, _ = t.tick(1601.0, dt, read_sent=lambda: "", run_active=lambda: False, dispatch=lambda: None)
+        self.assertEqual(act, "dispatched")
+
+    def test_new_window_after_expiry(self):
+        t = relay.DailyTrigger()
+        capture(t.hold, 1000.0, 120, 600)
+        capture(t.hold, 5000.0, 120, 600)
+        self.assertEqual(t.hold_until_ts, 5120.0)
 
 
 if __name__ == "__main__":

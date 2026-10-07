@@ -46,7 +46,8 @@ class TestBotWorkflow(unittest.TestCase):
         self.assertIs(self.wf["concurrency"]["cancel-in-progress"], False)
 
     def test_dispatch_inputs_match_what_the_code_sends(self):
-        declared = set(self.on["workflow_dispatch"]["inputs"])
+        # max_runtime_minutes 是給人手動啟動用的，bot 不會自己送（見下方專屬測試）
+        declared = set(self.on["workflow_dispatch"]["inputs"]) - {"max_runtime_minutes"}
         code = read("bot_listener.py") + read("bot_relay.py")
         sent = set(re.findall(r'"(handoff_[a-z_]+)"', code))
         self.assertEqual(sent, declared, "bot 送出的 input 與 bot.yml 宣告的不一致（GitHub 會回 422）")
@@ -58,12 +59,51 @@ class TestBotWorkflow(unittest.TestCase):
                          ("BOT_FAIL_COUNT", "handoff_fail_count")):
             self.assertRegex(text, rf"{env}: \$\{{\{{ github\.event\.inputs\.{inp} \}}\}}")
 
-    def test_recovery_step_runs_on_failure_and_does_not_need_pip(self):
-        steps = self.wf["jobs"]["bot-listener"]["steps"]
+    def _steps(self):
+        return self.wf["jobs"]["bot-listener"]["steps"]
+
+    def test_recovery_step_covers_failure_cancel_and_timeout_and_is_last(self):
+        steps = self._steps()
         rec = [s for s in steps if "bot_relay.py recover" in s.get("run", "")]
         self.assertEqual(len(rec), 1)
-        self.assertEqual(rec[0]["if"].replace(" ", ""), "${{failure()}}")
-        self.assertEqual(steps[-1], rec[0], "自救步驟必須是最後一步，才能涵蓋前面所有步驟的失敗")
+        cond = rec[0]["if"].replace(" ", "")
+        # always() 才會在被取消時執行；failure() 不會
+        self.assertEqual(cond, "${{always()&&steps.bot.outcome!='success'}}")
+        self.assertNotEqual(cond, "${{failure()}}")
+        self.assertEqual(steps[-1], rec[0], "自救步驟必須是最後一步，才能涵蓋前面所有步驟")
+
+    def test_bot_step_has_id_and_its_own_timeout_below_the_job_timeout(self):
+        bot = [s for s in self._steps() if s.get("id") == "bot"]
+        self.assertEqual(len(bot), 1)
+        self.assertIn("bot_listener.py", bot[0]["run"])
+        self.assertLess(bot[0]["timeout-minutes"], self.wf["jobs"]["bot-listener"]["timeout-minutes"])
+        self.assertGreater(bot[0]["timeout-minutes"], 300)   # 必須大於預設運行 300 分鐘，否則會在正常結束前被砍
+
+    def test_recovery_step_env_has_status_run_id_and_alert_credentials(self):
+        rec = [s for s in self._steps() if "bot_relay.py recover" in s.get("run", "")][0]
+        env = rec["env"]
+        self.assertEqual(env["BOT_JOB_STATUS"], "${{ job.status }}")
+        self.assertEqual(env["GITHUB_RUN_ID"], "${{ github.run_id }}")
+        self.assertIn("secrets.TELEGRAM_BOT_TOKEN", env["TELEGRAM_BOT_TOKEN"])
+        self.assertIn("secrets.TELEGRAM_CHAT_ID", env["BOT_ALERT_CHAT_ID"])
+        self.assertIn("-f bot_relay.py", rec["run"])          # checkout 失敗時有明確錯誤而不是 No such file
+
+    def test_max_runtime_minutes_input_is_optional_and_reaches_the_process(self):
+        inp = self.on["workflow_dispatch"]["inputs"]["max_runtime_minutes"]
+        self.assertFalse(inp["required"])
+        self.assertEqual(inp["default"], "")                   # 留空 = 預設 300 分鐘
+        bot = [s for s in self._steps() if s.get("id") == "bot"][0]
+        self.assertEqual(bot["env"]["BOT_MAX_RUNTIME_MINUTES"], "${{ github.event.inputs.max_runtime_minutes }}")
+
+    def test_relay_never_forwards_max_runtime_so_successors_use_the_default(self):
+        code = read("bot_listener.py") + read("bot_relay.py")
+        self.assertNotRegex(code, r'"max_runtime_minutes"\s*:')
+
+    def test_daily_and_bot_concurrency_groups_are_separate_and_never_cancel_running(self):
+        daily = load("daily.yml")["jobs"]["fetch-and-send"]["concurrency"]
+        self.assertTrue(daily["group"].startswith("corporate-bond-daily"))
+        self.assertNotEqual(daily["group"], self.wf["concurrency"]["group"])
+        self.assertIs(daily["cancel-in-progress"], False)
 
     def test_install_step_uses_retrying_script_and_pip_cache_is_on(self):
         steps = self.wf["jobs"]["bot-listener"]["steps"]
@@ -102,6 +142,26 @@ class TestDailyWorkflow(unittest.TestCase):
         expr = send["env"]["SKIP_IF_ALREADY_SENT"]
         self.assertIn("github.event_name == 'schedule'", expr)
         self.assertIn("github.event.inputs.skip_if_sent == 'true'", expr)
+
+    def test_checkout_uses_latest_branch_head_not_the_stale_trigger_sha(self):
+        steps = self.wf["jobs"]["fetch-and-send"]["steps"]
+        co = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+        self.assertEqual(len(co), 1)
+        self.assertEqual(co[0]["with"]["ref"], "${{ github.ref }}")
+        self.assertIs(steps[0], co[0], "checkout 必須是第一步")
+
+    def test_skip_decision_happens_in_send_step_after_checkout_and_install(self):
+        steps = self.wf["jobs"]["fetch-and-send"]["steps"]
+        idx = {s.get("id") or s["name"]: i for i, s in enumerate(steps)}
+        send = idx["send"]
+        checkout = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout")][0]
+        pip = [i for i, s in enumerate(steps) if "pip_install_retry" in s.get("run", "")][0]
+        self.assertLess(checkout, send)
+        self.assertLess(pip, send)
+        # 判斷本身在 main.py 的 mode_send 裡（send 步驟之內），不在 workflow 的 if 條件上
+        self.assertNotIn("last_sent", str(steps[send].get("if", "")))
+        main_src = read("main.py")
+        self.assertRegex(main_src, r'_truthy\("SKIP_IF_ALREADY_SENT"\) and already_sent\(target_date\)')
 
     def test_summary_step_always_runs(self):
         steps = self.wf["jobs"]["fetch-and-send"]["steps"]

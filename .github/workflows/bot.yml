@@ -21,6 +21,11 @@ on:
         description: "連續啟動失敗次數（自救接力用，手動啟動請留空）"
         required: false
         default: ""
+      # 供人手動啟動時縮短本棒，部署後用 15~20 分鐘驗證完整交接；留空 = 預設 300 分鐘（接力點在第 285 分鐘）。
+      max_runtime_minutes:
+        description: "本棒最長運行分鐘數，5~300（留空 = 300；驗證交接用 15~20；接力出去的下一棒一律用預設）"
+        required: false
+        default: ""
 
 # 最小必要權限：
 #   contents: read  — checkout 與讀取 reports/
@@ -63,7 +68,11 @@ jobs:
       - name: 📦 安裝套件（含重試）
         run: bash scripts/pip_install_retry.sh requirements.txt
 
+      # step 層級 timeout（310）小於 job 層級（330）：bot 卡死時，是「這一步」先失敗，
+      # job 仍活著，後面的自救步驟走一般的 failure 路徑，不必賭 job 逾時後 always() 步驟會不會執行。
       - name: 🤖 啟動 Telegram Bot 監聽（最多 5 小時，結束前自動接力）
+        id: bot
+        timeout-minutes: 310
         env:
           TZ: Asia/Taipei
           PYTHONIOENCODING: utf-8
@@ -82,17 +91,31 @@ jobs:
           # 交接資訊（接力啟動時由上一棒帶入；cron / 手動啟動為空）
           BOT_PREV_RUN_ID: ${{ github.event.inputs.handoff_prev_run_id }}
           BOT_MIN_UPDATE_ID: ${{ github.event.inputs.handoff_min_update_id }}
+          # 手動啟動時可縮短運行時間（驗證交接用）；留空 = 預設 300 分鐘。範圍 5~300，超出會被夾住並寫 log
+          BOT_MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes }}
           # 告警（接力最終失敗、觸發每日報告失敗）送到日報同一個聊天室；未設定則只寫 log
           BOT_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot_listener.py
 
-      # 本棒在啟動階段就失敗（pip、checkout…）或 bot 結束時接力沒成功，就由這一步代為排下一棒。
-      # 只用標準函式庫，所以 pip 失敗時也能跑。有退避與連續失敗上限，不會無限自我重啟。
-      - name: 🔁 失敗自救：排下一棒
-        if: ${{ failure() }}
+      # 只要 bot 這一步沒有成功（失敗、被取消、前面步驟失敗導致它被略過、整個 job 逾時），就代為排下一棒。
+      # 用 always() 而不是 failure()：failure() 在被取消時為 false，自救不會跑。
+      # 只用標準函式庫，所以 pip 失敗時也能跑；有退避、連續次數上限、「已有後繼就不重複排」，最終失敗會送 Telegram 告警。
+      # 注意：手動取消 bot 也會觸發自救（鏈會接著續下去）；要真正停掉 bot，請先在 Actions 頁面 Disable workflow 再取消。
+      - name: 🔁 自救：排下一棒（失敗／取消／逾時）
+        if: ${{ always() && steps.bot.outcome != 'success' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
           BOT_RELAY_REF: ${{ github.event.repository.default_branch || 'master' }}
           BOT_FAIL_COUNT: ${{ github.event.inputs.handoff_fail_count }}
-        run: python3 bot_relay.py recover
+          BOT_JOB_STATUS: ${{ job.status }}
+          # 自救最終失敗時的 Telegram 告警（只在最終失敗時才會送）；未設定則只寫 log
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ ! -f bot_relay.py ]; then
+            echo "::error title=bot 自救無法執行::找不到 bot_relay.py（checkout 失敗？）。bot 沒有後繼 run，只能等 cron 備援。"
+            exit 1
+          fi
+          python3 bot_relay.py recover

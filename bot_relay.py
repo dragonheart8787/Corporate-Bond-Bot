@@ -47,6 +47,12 @@ API_ROOT = "https://api.github.com"
 # 本棒連續「啟動即失敗」超過這個次數就停止自救，交給 cron 備援，避免壞掉的程式無限自我重啟
 MAX_CONSECUTIVE_START_FAILURES = 4
 
+# bot 單棒可執行時間（分鐘）的合法範圍與預設。預設 300 = 5 小時，接力點 = 300 - 15 = 285 分鐘。
+DEFAULT_RUNTIME_MIN = 300
+MIN_RUNTIME_MIN = 5
+MAX_RUNTIME_MIN = 300
+DEFAULT_RELAY_LEAD_SEC = 900
+
 
 # ─────────────────────────────────────────
 # 紀錄與遮罩
@@ -307,6 +313,110 @@ def daily_run_active(
     return any(r.get("status") in _ACTIVE_STATUSES for r in (data or {}).get("workflow_runs", []))
 
 
+_PENDING_STATUSES = {"queued", "pending", "waiting", "requested"}   # 不含 in_progress（那是本棒自己）
+
+
+def pending_successor_exists(
+    repo: str,
+    token: str,
+    self_run_id: str = "",
+    *,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> bool:
+    """bot.yml 是否已有「排隊中、尚未開始」的 run（接力後繼、cron 或手動排的）。
+    GitHub 同一 concurrency group 只留一個 pending，再 dispatch 會把它取代掉，所以已有就不必再排。"""
+    _, data = gh_request(
+        "GET", f"/repos/{repo}/actions/workflows/bot.yml/runs?per_page=10", token, opener=opener
+    )
+    return any(
+        r.get("status") in _PENDING_STATUSES and str(r.get("id")) != str(self_run_id)
+        for r in (data or {}).get("workflow_runs", [])
+    )
+
+
+def resolve_runtime(env: Optional[Dict[str, str]] = None) -> Tuple[int, int, str]:
+    """
+    決定本棒執行秒數與接力提前量，回傳 (max_runtime_sec, lead_sec, 說明)。
+    來源優先序：BOT_MAX_RUNTIME_MINUTES（workflow_dispatch 輸入 max_runtime_minutes）> BOT_MAX_RUNTIME_SEC（測試用）> 預設 300 分鐘。
+    輸入無效或超出 [5, 300] 分鐘時不報錯停擺，而是退回預設／夾到邊界，並在說明中明確標出（呼叫端會印 log）。
+    接力提前量 = min(900, 執行時間 / 3)：短測試棒也能在結束前先排好後繼，正式棒維持 15 分鐘。
+    """
+    env = dict(os.environ if env is None else env)
+    raw_min = (env.get("BOT_MAX_RUNTIME_MINUTES") or "").strip()
+    raw_sec = (env.get("BOT_MAX_RUNTIME_SEC") or "").strip()
+    note = ""
+    if raw_min:
+        try:
+            minutes = int(raw_min)
+        except ValueError:
+            minutes = DEFAULT_RUNTIME_MIN
+            note = f"⚠️ max_runtime_minutes={raw_min!r} 不是整數，改用預設 {DEFAULT_RUNTIME_MIN} 分鐘"
+        else:
+            clamped = max(MIN_RUNTIME_MIN, min(minutes, MAX_RUNTIME_MIN))
+            if clamped != minutes:
+                note = f"⚠️ max_runtime_minutes={minutes} 超出允許範圍 {MIN_RUNTIME_MIN}~{MAX_RUNTIME_MIN}，改用 {clamped} 分鐘"
+            else:
+                note = f"max_runtime_minutes={clamped}（手動指定）"
+            minutes = clamped
+        runtime = minutes * 60
+    elif raw_sec:
+        try:
+            runtime = max(1, int(raw_sec))
+            note = f"BOT_MAX_RUNTIME_SEC={runtime}（環境變數，測試用）"
+        except ValueError:
+            runtime = DEFAULT_RUNTIME_MIN * 60
+            note = f"⚠️ BOT_MAX_RUNTIME_SEC={raw_sec!r} 不是整數，改用預設 {DEFAULT_RUNTIME_MIN} 分鐘"
+    else:
+        runtime = DEFAULT_RUNTIME_MIN * 60
+        note = f"預設 {DEFAULT_RUNTIME_MIN} 分鐘"
+    try:
+        lead_cfg = int((env.get("BOT_RELAY_LEAD_SEC") or "").strip() or DEFAULT_RELAY_LEAD_SEC)
+    except ValueError:
+        lead_cfg = DEFAULT_RELAY_LEAD_SEC
+    lead = max(1, min(lead_cfg, runtime // 3 if runtime >= 3 else 1))
+    return runtime, lead, note
+
+
+def send_telegram_alert(
+    text: str,
+    env: Optional[Dict[str, str]] = None,
+    *,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> bool:
+    """
+    最終失敗時的 Telegram 告警（標準函式庫，pip 失敗時也能用）。成功回 True。
+    沒設定 token / chat id、或送出失敗都回 False 並寫 log——不拋例外，因為它本身就是最後一道通報。
+    token、chat id 不會出現在 log 中。
+    """
+    env = dict(os.environ if env is None else env)
+    token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat = (env.get("BOT_ALERT_CHAT_ID") or "").strip()
+    if not token or not chat:
+        log("ℹ️ 未設定 TELEGRAM_BOT_TOKEN / BOT_ALERT_CHAT_ID，告警只寫入 log（run 頁面仍有 ::error:: 註解）")
+        return False
+    body = json.dumps({"chat_id": chat, "text": "🚨 " + text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with opener(req, timeout=20) as resp:
+            ok = 200 <= int(resp.status) < 300
+    except urllib.error.HTTPError as e:
+        log(f"❌ Telegram 告警送出失敗：HTTP {e.code}（{mask_chat_id(chat)}）")
+        return False
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        log(f"❌ Telegram 告警送出失敗：{redact(e)}（{mask_chat_id(chat)}）")
+        return False
+    if not ok:
+        log(f"❌ Telegram 告警回應非 2xx（{mask_chat_id(chat)}）")
+        return False
+    log(f"📨 已送出 Telegram 告警（{mask_chat_id(chat)}）")
+    return True
+
+
 # ─────────────────────────────────────────
 # 接力狀態機
 # ─────────────────────────────────────────
@@ -392,8 +502,25 @@ class DailyTrigger:
     # bot 剛處理完 /cb、/all（用同一組 Telegram session 抓取）後的一小段時間內不觸發日報，
     # 避免兩台機器同時使用同一組 session 而被 Telegram 撤銷（2026-09 實際發生過）。
     hold_until_ts: float = 0.0
+    hold_window_start: float = 0.0
     _noted: set = field(default_factory=set)
     alerted_dates: set = field(default_factory=set)
+
+    def hold(self, now_ts: float, hold_sec: float = 120.0, max_total_sec: float = 600.0) -> float:
+        """
+        暫緩觸發日報 hold_sec 秒。連續的 /cb、/all 會延長，但從「這一輪暫緩開始」算起最多 max_total_sec，
+        到頂就一定放行（否則有人反覆下指令就能讓日報永遠發不出去）。回傳實際的 hold_until_ts。
+        """
+        if now_ts >= self.hold_until_ts:
+            self.hold_window_start = now_ts   # 前一輪已結束，開新的一輪
+        limit = self.hold_window_start + max_total_sec
+        want = now_ts + hold_sec
+        until = min(want, limit)
+        if until < want:
+            log(f"⏸ 暫緩觸發日報已達本輪上限 {int(max_total_sec)} 秒，不再延長（到點即放行）")
+        self.hold_until_ts = max(self.hold_until_ts, until)
+        log(f"⏸ 暫緩觸發每日報告 {int(max(0, self.hold_until_ts - now_ts))} 秒（避免與剛結束的抓取同時使用 Telegram session）")
+        return self.hold_until_ts
 
     def in_window(self, now_tw: datetime) -> bool:
         return (now_tw.hour, now_tw.minute) >= self.start_hm or now_tw.hour < _rollover_hour()
@@ -461,7 +588,7 @@ class DailyTrigger:
 
 
 # ─────────────────────────────────────────
-# 啟動即失敗的自救（bot.yml 的 failure() 步驟呼叫）
+# 失敗／被取消／逾時時的自救（bot.yml 最後一步呼叫）
 # ─────────────────────────────────────────
 def cmd_recover(
     env: Optional[Dict[str, str]] = None,
@@ -470,30 +597,52 @@ def cmd_recover(
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> int:
     """
-    本棒在啟動階段就失敗（pip 安裝失敗、checkout 失敗……），沒機會跑自己的接力，
-    所以由這個步驟代為觸發下一棒：先退避（60 / 120 / 240 / 480 秒），並有連續失敗上限，
-    避免壞掉的程式碼無限自我重啟。回傳程式結束碼：0 = 已排下一棒；1 = 放棄（原因已 ::error::）。
+    本棒沒有正常收尾（啟動階段失敗、bot 崩潰、接力沒成功、被取消或逾時）時，代為排下一棒。
+    回傳結束碼：0 = 已排（或已有後繼）；1 = 放棄（原因已 ::error:: 並盡力以 Telegram 告警）。
+
+    三道保險，避免壞掉的程式或自己造成無限重啟／互相覆蓋：
+      - 連續次數上限：BOT_FAIL_COUNT >= 4 就停止（共最多連續 5 個 run：count 0,1,2,3 各自救一次）。
+      - 最小間隔：失敗路徑先退避 60 / 120 / 240 / 480 秒；取消路徑（有 cancel 寬限時間限制）15 / 30 / 45 / 60 秒。
+      - 已有排隊中的後繼就不再排（GitHub 同一 group 只留一個 pending，再排會把它取代掉，
+        包含使用者手動排的驗證 run）。查詢失敗則照常排（寧可重複，不可無人接手）。
+    取消與失敗都計入連續次數，所以「被取消 → 自救 → 又被取消」同樣會在上限停下來。
     """
     env = dict(os.environ if env is None else env)
     try:
         fail_count = int(env.get("BOT_FAIL_COUNT") or 0)
     except ValueError:
         fail_count = 0
+    status = (env.get("BOT_JOB_STATUS") or "failure").strip().lower()
+    cancelled = status == "cancelled"
+    label = "被取消或逾時" if cancelled else "失敗"
 
     if fail_count >= MAX_CONSECUTIVE_START_FAILURES:
-        gha_error(
-            "bot 連續啟動失敗，停止自救",
-            f"已連續 {fail_count} 次在啟動階段失敗，不再自動重啟（避免壞掉的程式無限重跑）。"
-            "請查看上一個失敗 run 的 log；cron 備援仍會嘗試拉起 bot。",
+        msg = (
+            f"已連續 {fail_count} 次未正常收尾（最近一次：{label}），不再自動重啟（避免壞掉的程式無限重跑）。"
+            "請查看上一個失敗 run 的 log；cron 備援仍會嘗試拉起 bot。"
         )
+        gha_error("bot 連續失敗，停止自救", msg)
+        send_telegram_alert("bot 連續失敗，已停止自動重啟。" + msg, env, opener=opener)
         return 1
 
-    delay = 60 * (2 ** fail_count)
-    log(f"🔁 本棒啟動失敗（連續第 {fail_count + 1} 次），{delay} 秒後觸發下一棒")
+    delay = 15 * (fail_count + 1) if cancelled else 60 * (2 ** fail_count)
+    log(f"🔁 本棒{label}（連續第 {fail_count + 1} 次），{delay} 秒後檢查並排下一棒")
     sleep(delay)
+
+    repo = env.get("GITHUB_REPOSITORY", "")
+    token = env.get("GITHUB_TOKEN", "")
+    dry_run = env.get("BOT_RELAY_DRY_RUN", "") == "1"
+    if not dry_run:
+        try:
+            if pending_successor_exists(repo, token, env.get("GITHUB_RUN_ID", ""), opener=opener):
+                log("✅ bot.yml 已有排隊中的後繼 run，本棒不再重複排（避免取代掉它）")
+                return 0
+        except GitHubApiError as e:
+            log(f"⚠️ 無法確認是否已有後繼 run，照常觸發（寧可重複也不能沒人接手）：{redact(e)}")
+
     try:
         dispatch_workflow(
-            env.get("GITHUB_REPOSITORY", ""),
+            repo,
             "bot.yml",
             env.get("BOT_RELAY_REF") or env.get("GITHUB_REF_NAME") or "master",
             # 只帶有值的欄位：沒有水位線可帶時不送空字串，避免對 API 做不必要的假設
@@ -505,15 +654,17 @@ def cmd_recover(
                 }.items()
                 if v != ""
             },
-            env.get("GITHUB_TOKEN", ""),
-            dry_run=env.get("BOT_RELAY_DRY_RUN", "") == "1",
-            attempts=4,
-            base_delay=10,
+            token,
+            dry_run=dry_run,
+            attempts=3 if cancelled else 4,
+            base_delay=5 if cancelled else 10,
             sleep=sleep,
             opener=opener,
         )
     except GitHubApiError as e:
-        gha_error("啟動失敗且自救接力也失敗", f"{e}。bot 目前沒有後繼 run，只能等 cron 備援。")
+        msg = f"本棒{label}，自救接力也失敗：{e}。bot 目前沒有後繼 run，只能等 cron 備援。"
+        gha_error("bot 自救接力失敗", msg)
+        send_telegram_alert("bot " + msg, env, opener=opener)
         return 1
     return 0
 

@@ -27,10 +27,10 @@ from telegram_date_utils import report_yyyymmdd
 
 TW = timezone(timedelta(hours=8))
 TW_ZONE = ZoneInfo("Asia/Taipei")
-MAX_RUNTIME_SEC = int(os.environ.get("BOT_MAX_RUNTIME_SEC", str(5 * 3600)))  # 每次 GitHub Actions Job 最多跑 5 小時
-# 本棒結束前多久開始觸發下一棒。留足夠的重試時間，也讓後繼 run 在本棒結束前就已排隊，
-# 本棒一結束它就立刻接手，交接不再依賴那一刻 GitHub 還肯不肯建立 run。
-RELAY_LEAD_SEC = int(os.environ.get("BOT_RELAY_LEAD_SEC", "900"))
+# 本棒可執行時間與「結束前多久觸發下一棒」由 relay.resolve_runtime() 在 main() 啟動時決定：
+#   預設 300 分鐘（5 小時），接力點 = 結束前 min(15 分鐘, 執行時間/3)。
+#   workflow_dispatch 輸入 max_runtime_minutes（5~300）可縮短，供部署後以 15~20 分鐘驗證完整交接。
+# 提前觸發是為了讓後繼 run 在本棒結束前就已排隊，本棒一結束它就立刻接手，交接不再依賴那一刻 GitHub 還肯不肯建立 run。
 
 # 開始抓取前停頓（讓使用者先看到「正在抓取」訊息）
 PRE_FETCH_DELAY_SEC = int(os.environ.get("BOT_PRE_FETCH_DELAY_SEC", "4"))
@@ -511,29 +511,48 @@ def notify_alert(bot_token: str, text: str) -> None:
         safe_print("❌ 告警訊息也送不出去，請直接查看 Actions 頁面")
 
 
-DAILY_IDLE_MAX_WAIT_SEC = int(os.environ.get("BOT_DAILY_IDLE_MAX_WAIT_SEC", "120"))
-DAILY_HOLD_AFTER_FETCH_SEC = 120
+DAILY_IDLE_MAX_WAIT_SEC = int(os.environ.get("BOT_DAILY_IDLE_MAX_WAIT_SEC", "120"))   # 等日報結束的最長秒數
+DAILY_IDLE_POLL_SEC = 10.0
+DAILY_IDLE_API_RETRIES = 3          # 查詢 Actions API 連續失敗幾次才放棄（每次間隔 5 秒）
+DAILY_IDLE_API_RETRY_SEC = 5.0
+DAILY_HOLD_AFTER_FETCH_SEC = 120    # 每次 /cb、/all 抓取後暫緩觸發日報的秒數
+DAILY_HOLD_MAX_TOTAL_SEC = 600      # 連續指令延長暫緩的上限（從這一輪暫緩開始算）
 
 
-def wait_for_daily_idle(github_repo: str, github_token: str, max_wait: float = DAILY_IDLE_MAX_WAIT_SEC, poll: float = 10.0) -> bool:
+def wait_for_daily_idle(
+    github_repo: str,
+    github_token: str,
+    max_wait: float = DAILY_IDLE_MAX_WAIT_SEC,
+    poll: float = DAILY_IDLE_POLL_SEC,
+) -> bool:
     """
     抓取前先確認每日報告 workflow 沒在跑（它也會用同一組 Telegram session 抓取）。
-    兩台機器同時使用同一組 session 會被 Telegram 撤銷（曾造成整個系統癱瘓），所以寧可多等一會兒。
-    查詢失敗或等太久都只記 log 並照常繼續（指令回應不能被卡死），回傳是否確定為閒置。
+    兩台機器同時使用同一組 session 會被 Telegram 撤銷（曾造成整個系統癱瘓）。
+
+    fail-closed：回傳 True 才代表「確定閒置、可以抓」。等超過 max_wait 或查詢 API 連續失敗，
+    一律回 False（並寫 log），呼叫端必須因此略過即時抓取、改讀已存檔報告。
+    沒有 GITHUB_TOKEN 或明確關閉每日報告觸發（BOT_DAILY_TRIGGER=0）時視為不需檢查。
     """
     if not github_token or os.environ.get("BOT_DAILY_TRIGGER", "1") == "0":
         return True
     waited = 0.0
+    api_failures = 0
     while True:
         try:
             active = relay.daily_run_active(github_repo, github_token)
+            api_failures = 0
         except relay.GitHubApiError as e:
-            safe_print(f"⚠️ 無法確認每日報告是否在執行，照常抓取（有小機率與日報同時使用 session）：{relay.redact(e)}")
-            return False
+            api_failures += 1
+            safe_print(f"⚠️ 無法確認每日報告是否在執行（第 {api_failures}/{DAILY_IDLE_API_RETRIES} 次）：{relay.redact(e)}")
+            if api_failures >= DAILY_IDLE_API_RETRIES:
+                safe_print("🛑 持續無法確認每日報告狀態，為避免與日報同時使用同一組 Telegram session，本次略過即時抓取")
+                return False
+            time.sleep(DAILY_IDLE_API_RETRY_SEC)
+            continue
         if not active:
             return True
         if waited >= max_wait:
-            safe_print(f"⚠️ 每日報告已執行超過 {int(max_wait)} 秒，不再等待，照常抓取（有小機率與日報同時使用 session）")
+            safe_print(f"🛑 每日報告已執行超過 {int(max_wait)} 秒，為避免與日報同時使用同一組 Telegram session，本次略過即時抓取")
             return False
         if waited == 0:
             safe_print("⏳ 每日報告正在執行，等它結束再抓取，避免同一組 Telegram session 同時從兩台機器連線")
@@ -571,13 +590,20 @@ def handle_report_command(
 
     if can_run_fetch():
         send_message(bot_token, chat_id, "📡 正在抓取頻道訊息並產生報告，請稍候（約 1～5 分鐘）…")
-        wait_for_daily_idle(github_repo, github_token)
-        rc = run_fetch_subprocess()
-        if rc != 0:
+        if wait_for_daily_idle(github_repo, github_token):
+            rc = run_fetch_subprocess()
+            if rc != 0:
+                send_message(
+                    bot_token,
+                    chat_id,
+                    "⚠️ 即時抓取未完全成功，將改讀 GitHub 上最近一次已存檔的報告。",
+                )
+        else:
             send_message(
                 bot_token,
                 chat_id,
-                "⚠️ 即時抓取未完全成功，將改讀 GitHub 上最近一次已存檔的報告。",
+                "⚠️ 每日報告正在執行（或暫時無法確認），為避免同一組 Telegram 登入被同時使用而失效，"
+                "這次不即時抓取，改讀 GitHub 上最近一次已存檔的報告。稍後再下指令即可取得最新資料。",
             )
     else:
         send_message(
@@ -638,17 +664,19 @@ def main() -> int:
         safe_print("⚠️ 缺少 GITHUB_TOKEN：接力與每日報告自動觸發都無法運作，只剩 cron 備援")
         relay_enabled = daily_enabled = False
 
+    max_runtime_sec, relay_lead_sec, runtime_note = relay.resolve_runtime()
     start_time = time.time()
-    deadline = start_time + MAX_RUNTIME_SEC
+    deadline = start_time + max_runtime_sec
     now_str = datetime.fromtimestamp(start_time, TW_ZONE).strftime("%Y-%m-%d %H:%M:%S")
 
     safe_print(f"🤖 Bot 啟動  {now_str} 台灣時間（運行至 {_fmt_tw(deadline)}）")
     safe_print(f"   run={run_id}  觸發方式={event}  ref={relay_ref}")
+    safe_print(f"   運行時間：{max_runtime_sec // 60} 分鐘（{runtime_note}）；接力提前量 {relay_lead_sec} 秒")
     safe_print(f"   即時抓取：{'開啟' if can_run_fetch() else '關閉（僅讀 GitHub）'}")
     safe_print(f"   抓取前後停頓：{PRE_FETCH_DELAY_SEC}s / {POST_FETCH_DELAY_SEC}s")
     safe_print(
         f"   接力：{'開啟' if relay_enabled else '關閉'}"
-        + (f"（本棒 {_fmt_tw(deadline - RELAY_LEAD_SEC)} 起觸發下一棒）" if relay_enabled else "")
+        + (f"（本棒 {_fmt_tw(deadline - relay_lead_sec)} 起觸發下一棒）" if relay_enabled else "")
         + f"  每日報告觸發：{'開啟' if daily_enabled else '關閉'}"
         + ("  🧪 DRY-RUN" if dry_run else "")
     )
@@ -684,8 +712,8 @@ def main() -> int:
 
     relay_state = relay.RelayState(
         start_time,
-        MAX_RUNTIME_SEC,
-        RELAY_LEAD_SEC,
+        max_runtime_sec,
+        relay_lead_sec,
         retry_interval_sec=float(os.environ.get("BOT_RELAY_RETRY_SEC", "120")),   # 正式環境 120 秒；僅測試會縮短
     )
     daily = relay.DailyTrigger(enabled=daily_enabled)
@@ -817,12 +845,12 @@ def main() -> int:
             if cmd == "/all":
                 handled += 1
                 handle_report_command(bot_token, chat_id, github_token, github_repo, "all")
-                daily.hold_until_ts = time.time() + DAILY_HOLD_AFTER_FETCH_SEC
+                daily.hold(time.time(), DAILY_HOLD_AFTER_FETCH_SEC, DAILY_HOLD_MAX_TOTAL_SEC)
 
             elif cmd == "/cb":
                 handled += 1
                 handle_report_command(bot_token, chat_id, github_token, github_repo, "cb")
-                daily.hold_until_ts = time.time() + DAILY_HOLD_AFTER_FETCH_SEC
+                daily.hold(time.time(), DAILY_HOLD_AFTER_FETCH_SEC, DAILY_HOLD_MAX_TOTAL_SEC)
 
             elif cmd == "/status":
                 handled += 1
