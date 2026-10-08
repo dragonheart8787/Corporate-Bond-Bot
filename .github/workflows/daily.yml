@@ -44,6 +44,15 @@ on:
           - send
           - fetch
         default: all
+      skip_if_sent:
+        description: |
+          true = 若該報告日期已成功送出（reports/.last_sent）就略過發送，不重複發 Telegram。
+          bot 自動觸發每日報告時固定帶 true；手動補送請維持 false。
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
 
 permissions:
   contents: write
@@ -63,8 +72,22 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      - name: 📥 Checkout 程式碼
+      # 明確 checkout 分支最新 commit，而不是預設的「觸發當下的 github.sha」：
+      # 這個 run 可能在 concurrency 佇列裡等很久，等到時 reports/.last_sent 早被前一個 run 更新了。
+      # 用舊的 sha 會讓 SKIP_IF_ALREADY_SENT 讀到過期標記而重發日報。
+      - name: 📥 Checkout 程式碼（分支最新）
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: 📌 Checkout 版本與防重發標記
+        run: |
+          echo "trigger_sha=${GITHUB_SHA}"
+          echo "checkout_head=$(git rev-parse HEAD)"
+          if [ "${GITHUB_SHA}" != "$(git rev-parse HEAD)" ]; then
+            echo "::notice::排隊期間分支已前進：本次使用較新的 checkout（防重發標記以最新為準）"
+          fi
+          echo ".last_sent=$(cat reports/.last_sent 2>/dev/null || echo '(無)')"
 
       - name: 🔎 觸發來源與時間（除錯「一直自動發送」必看）
         run: |
@@ -88,8 +111,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: 📦 安裝套件
-        run: pip install -r requirements.txt
+      # PyPI 偶發失敗會讓整個 run 起不來，所以重試；最終失敗會明確 fail。
+      - name: 📦 安裝套件（含重試）
+        run: bash scripts/pip_install_retry.sh requirements.txt
 
       # 日期解析一次就好：後續 fetch / 存檔 / send 全部吃同一個 REPORT_DATE，
       # 避免 job 執行中跨過台北午夜時，各步驟算出不同日期。
@@ -102,10 +126,21 @@ jobs:
             echo "::warning::排程延遲已跨過台北午夜，報告日期回退為 ${RD}"
           fi
 
+      # 防重發守門放在「抓取之前」：已送過的日報不該再連線 Telegram 抓一遍
+      # （多一次連線就多一次 session 被撤銷的風險，也浪費 Actions 分鐘數）。
+      # 這時已經過了 concurrency 排隊與「分支最新」的 checkout，所以讀到的 .last_sent 是最新的。
+      # 判斷邏輯在 main.py check-sent；send 步驟內的同一個判斷仍保留當第二道防線。
+      - name: 🛡️ 防重發守門（已送過就略過抓取與發送）
+        id: guard
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        env:
+          SKIP_IF_ALREADY_SENT: ${{ github.event_name == 'schedule' || github.event.inputs.skip_if_sent == 'true' }}
+        run: python main.py check-sent
+
       # fetch 失敗仍繼續（用已 checkout 的 reports/complete_report_latest.txt 發送）
       - name: 📡 抓取並生成 complete_report
         id: fetch
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send')) }}
         continue-on-error: true
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
@@ -125,7 +160,7 @@ jobs:
           python main.py fetch
 
       - name: 💾 儲存報告至 reports/
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send')) }}
         run: |
           mkdir -p reports
           REPORT="outputs/daily/complete_report_${REPORT_DATE}.txt"
@@ -138,7 +173,7 @@ jobs:
 
       # 先發送再 git push：避免 push 網路延遲／重試卡住 Telegram 10～20+ 分鐘（send 讀 runner 上檔案即可）
       - name: 🔍 發送前檢查報告檔
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch')) }}
         run: |
           ls -la reports/ 2>/dev/null || echo "（無 reports 目錄）"
           ls -la outputs/daily/ 2>/dev/null || echo "（無 outputs/daily）"
@@ -149,7 +184,8 @@ jobs:
           fi
 
       - name: 📤 傳送轉換公司債公告至 Telegram Bot
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch') }}
+        id: send
+        if: ${{ steps.guard.outputs.skip != 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'fetch')) }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -159,9 +195,9 @@ jobs:
           TELEGRAM_SESSION_STRING: ${{ secrets.TELEGRAM_SESSION_STRING }}
           TELEGRAM_CHAT_NAME: ${{ secrets.TELEGRAM_CHAT_NAME }}
           TELEGRAM_APPEND_ACTIONS_MARKER: "1"
-          # 備援排程防重發：若 reports/.last_sent 已是本次 REPORT_DATE 就略過發送。
-          # 手動 workflow_dispatch 不套用，方便隨時重送。
-          SKIP_IF_ALREADY_SENT: ${{ github.event_name == 'schedule' }}
+          # 防重發：若 reports/.last_sent 已是本次 REPORT_DATE 就略過發送。
+          # cron 備援一律套用；bot 自動觸發時帶 skip_if_sent=true 也套用；手動 dispatch 預設不套用，方便隨時重送。
+          SKIP_IF_ALREADY_SENT: ${{ github.event_name == 'schedule' || github.event.inputs.skip_if_sent == 'true' }}
           # 僅在「本 job 已跑過 fetch」時略過 send 內二次 fetch；單獨 mode=send 時仍允許重試抓取
           SKIP_SEND_REFETCH_ON_EMPTY: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'send') }}
         run: |
@@ -176,6 +212,10 @@ jobs:
       # 否則備援排程的防重發標記永遠不會被提交。
       - name: 📝 Commit 報告到 GitHub
         if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          # 最終推送失敗時的 Telegram 告警（只在最終失敗才會送）；未設定則只有 ::error::
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -185,17 +225,59 @@ jobs:
             exit 0
           fi
           git commit -m "update: 每日報告 ${REPORT_DATE:-$(date '+%Y-%m-%d')}"
-          # 備援排程與主排程可能接連跑，push 前先 rebase，避免標記因 non-fast-forward 掉失
-          for i in 1 2 3; do
-            if git push; then
-              echo "✅ push 成功"
-              exit 0
-            fi
-            echo "push 失敗，pull --rebase 後重試 ($i/3)"
-            git pull --rebase origin master || true
-            sleep $((i * 3))
-          done
-          echo "::warning::git push 最終失敗（Telegram 已送出，但 .last_sent 未入庫，備援可能重發）"
+          # 每次嘗試前 pull --rebase、失敗退避重試；最終失敗 → ::error:: + Telegram 告警 + 此步驟失敗（run 變紅）
+          bash scripts/push_with_retry.sh
+
+      # 不論前面成功或失敗都輸出：這一次實際「產生」與「送出」的是哪一天的報告、結果如何。
+      # 送出結果讀 main.py 寫的 send_result.txt（sent / skipped_already_sent / failed），不靠推測。
+      - name: 🧾 本次結果摘要（報告日期／產生／送出）
+        if: ${{ always() }}
+        env:
+          FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+          SEND_OUTCOME: ${{ steps.send.outcome }}
+          EVENT_NAME: ${{ github.event_name }}
+          SKIP_IF_SENT_INPUT: ${{ github.event.inputs.skip_if_sent }}
+        run: |
+          RD="${REPORT_DATE:-（未解析：前面的步驟在解析日期前就失敗）}"
+          REPORT_FILE="outputs/daily/complete_report_${REPORT_DATE:-none}.txt"
+          if [ -f "$REPORT_FILE" ]; then
+            GENERATED="是（$(wc -c < "$REPORT_FILE") bytes，$(grep -m1 '生成時間' "$REPORT_FILE" || echo '無生成時間標頭')）"
+          else
+            GENERATED="否（本次沒有產生 ${REPORT_FILE}）"
+          fi
+          SEND_RESULT="未知（沒有送出結果檔）"
+          if [ -f outputs/daily/send_result.txt ]; then
+            SEND_RESULT="$(cut -d' ' -f2- outputs/daily/send_result.txt | tr -d '\r\n')"
+          elif [ "${SEND_OUTCOME}" = "skipped" ]; then
+            SEND_RESULT="未執行（此模式不發送）"
+          fi
+          LAST_SENT="$(tr -d '[:space:]' < reports/.last_sent 2>/dev/null || true)"
+          LAST_SENT="${LAST_SENT:-（無）}"
+
+          echo "=============== 本次結果摘要 ==============="
+          echo "報告日期（REPORT_DATE）：${RD}"
+          echo "觸發事件：${EVENT_NAME}（skip_if_sent=${SKIP_IF_SENT_INPUT:-n/a}）"
+          echo "抓取步驟：${FETCH_OUTCOME:-skipped}"
+          echo "報告已產生：${GENERATED}"
+          echo "Telegram 送出：${SEND_RESULT}（send 步驟 ${SEND_OUTCOME:-skipped}）"
+          echo "reports/.last_sent：${LAST_SENT}"
+          echo "============================================"
+
+          {
+            echo "### 每日報告結果"
+            echo "| 項目 | 結果 |"
+            echo "|---|---|"
+            echo "| 報告日期 | \`${RD}\` |"
+            echo "| 觸發事件 | \`${EVENT_NAME}\` |"
+            echo "| 抓取 | ${FETCH_OUTCOME:-skipped} |"
+            echo "| 報告已產生 | ${GENERATED} |"
+            echo "| Telegram 送出 | **${SEND_RESULT}** |"
+            echo "| reports/.last_sent | \`${LAST_SENT}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${SEND_RESULT%% *}" = "sent" ] && [ "${LAST_SENT}" != "${REPORT_DATE:-}" ]; then
+            echo "::warning::已送出但 reports/.last_sent（${LAST_SENT}）與報告日期（${REPORT_DATE:-}）不一致，防重發標記可能有問題"
+          fi
 
       - name: 📦 上傳每日報告（保留 30 天）
         if: always()

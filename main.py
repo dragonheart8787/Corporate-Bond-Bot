@@ -21,6 +21,7 @@ import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from bot_relay import redact   # 例外訊息可能含帶 token 的請求網址，輸出前一律遮罩
 from telegram_date_utils import report_yyyymmdd
 
 # 與 quick_format / exporter 一致，避免「固定 UTC+8」與 IANA 時區在邊界日期不一致
@@ -62,6 +63,23 @@ def mark_sent(date_str: str) -> None:
         safe_print(f"📝 已記錄發送標記：{SENT_MARKER} = {date_str}")
     except OSError as e:
         safe_print(f"⚠️ 無法寫入發送標記（{e}），備援排程可能重發")
+
+
+SEND_RESULT_FILE = os.path.join("outputs", "daily", "send_result.txt")
+
+
+def record_send_result(date_str: str, status: str) -> None:
+    """
+    把本次送出結果寫成一行「<報告日期> <status>」，status ∈ sent | skipped_already_sent | failed。
+    daily.yml 結尾的摘要步驟讀它，如實輸出「實際送出」的結果，而不是從 exit code 或標記檔去推測。
+    寫檔失敗不影響發送本身，但要留 log。
+    """
+    try:
+        os.makedirs(os.path.dirname(SEND_RESULT_FILE), exist_ok=True)
+        with open(SEND_RESULT_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{date_str} {status}\n")
+    except OSError as e:
+        safe_print(f"⚠️ 無法寫入送出結果檔（{e}），workflow 摘要將顯示「未知」")
 
 
 def report_path() -> str:
@@ -126,7 +144,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
                     safe_print(f"  ⚠️ 第 {idx} 段失敗（{resp.status_code}），重試 {attempt+1}/3...")
                     time.sleep(2)
             except Exception as e:
-                safe_print(f"  ⚠️ 第 {idx} 段錯誤（{e}），重試 {attempt+1}/3...")
+                safe_print(f"  ⚠️ 第 {idx} 段錯誤（{redact(e)}），重試 {attempt+1}/3...")
                 time.sleep(3)
 
         if not sent:
@@ -286,6 +304,35 @@ def _is_empty_result(content: str) -> bool:
 # ─────────────────────────────────────────
 # MODE: send — 讀取 complete_report 並傳送
 # ─────────────────────────────────────────
+def skip_if_already_sent(target_date: str) -> bool:
+    """SKIP_IF_ALREADY_SENT 開啟且該日已成功送出則回 True（並寫送出結果檔）。fetch 與 send 之前都要先問它。"""
+    if _truthy("SKIP_IF_ALREADY_SENT") and already_sent(target_date):
+        safe_print(f"✅ {target_date} 的報告先前已成功發送（{SENT_MARKER}），略過本次抓取與發送")
+        record_send_result(target_date, "skipped_already_sent")
+        return True
+    return False
+
+
+def mode_check_sent() -> None:
+    """
+    供 daily.yml 在「抓取之前」呼叫：已送過就讓後續的 fetch / 存檔 / send 步驟整個略過。
+    結果寫進 $GITHUB_OUTPUT 的 skip=true|false；在 Actions 內寫不進去就明確失敗，不能默默當成 false。
+    """
+    target_date = today_str()
+    skip = skip_if_already_sent(target_date)
+    if not skip:
+        safe_print(f"ℹ️ {target_date} 尚未送出（或未啟用防重發），繼續抓取與發送")
+    out = os.environ.get("GITHUB_OUTPUT", "")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:   # 寫失敗會丟例外 → 步驟失敗 → 後續步驟因 success() 隱含條件被略過（fail-closed）
+            f.write(f"skip={'true' if skip else 'false'}\n")
+    elif os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        safe_print("❌ 在 Actions 內卻沒有 GITHUB_OUTPUT，無法把守門結果交給後續步驟")
+        sys.exit(1)
+    else:
+        safe_print(f"skip={'true' if skip else 'false'}（非 Actions 環境，未寫 GITHUB_OUTPUT）")
+
+
 def mode_send() -> None:
     safe_print("\n" + "=" * 55)
     safe_print(f"📤 [SEND] {datetime.now(_TWZ).strftime('%Y-%m-%d %H:%M:%S')} 台灣時間")
@@ -304,26 +351,29 @@ def mode_send() -> None:
         )
 
     # 備援排程用：若這一天已經成功發送過，就不要再送一次
-    if _truthy("SKIP_IF_ALREADY_SENT") and already_sent(target_date):
-        safe_print(f"✅ {target_date} 的報告先前已成功發送（{SENT_MARKER}），略過本次發送")
+    if skip_if_already_sent(target_date):
         return
 
     bot_token, chat_id = load_bot_credentials()
 
     if not bot_token:
         safe_print("❌ 缺少 TELEGRAM_BOT_TOKEN，請在 configs/telegram_bot_config.json 或 GitHub Secrets 設定")
+        record_send_result(target_date, "failed")
         sys.exit(1)
     if not chat_id or "請填入" in chat_id:
         safe_print("❌ 尚未設定 TELEGRAM_CHAT_ID")
         safe_print("   請開啟瀏覽器前往：")
-        safe_print(f"   https://api.telegram.org/bot{bot_token}/getUpdates")
+        # 不要把 token 印出來（Actions log 對 public repo 人人可見）；網址用佔位符，使用者自行代入
+        safe_print("   https://api.telegram.org/bot<你的BOT_TOKEN>/getUpdates")
         safe_print("   先對 Bot 傳一則訊息，再從 JSON 中找 \"id\" 的數值")
         safe_print("   填入 configs/telegram_bot_config.json 的 chat_id 欄位")
+        record_send_result(target_date, "failed")
         sys.exit(1)
 
     path = report_path()
     if not os.path.exists(path):
         safe_print(f"❌ 找不到報告：{path}（請先執行 fetch 步驟）")
+        record_send_result(target_date, "failed")
         sys.exit(1)
 
     with open(path, "r", encoding="utf-8") as f:
@@ -385,9 +435,11 @@ def mode_send() -> None:
     if ok:
         safe_print("✅ Telegram 傳送完成！")
         mark_sent(target_date)
+        record_send_result(target_date, "sent")
     else:
         # 部分失敗不寫標記，讓備援排程有機會補送
         safe_print("⚠️ 部分段落發送失敗")
+        record_send_result(target_date, "failed")
         sys.exit(1)
 
 
@@ -402,7 +454,12 @@ def main() -> None:
             sys.exit(1)
     elif mode == "send":
         mode_send()
+    elif mode == "check-sent":
+        mode_check_sent()
     elif mode == "all":
+        # 已送過就連抓取都不做（fetch 會連線 Telegram）
+        if skip_if_already_sent(today_str()):
+            return
         ok = mode_fetch()
         safe_print("\n▶ 直接發送（all 模式）")
         mode_send()          # 抓取失敗仍嘗試發送（可能用 repo 內備份報告）
@@ -412,7 +469,7 @@ def main() -> None:
         # 供 workflow 解析一次日期後傳給所有步驟（見 daily.yml）
         print(today_str())
     else:
-        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all / report-date）")
+        safe_print(f"❌ 未知模式：{mode}（請使用 fetch / send / all / report-date / check-sent）")
         sys.exit(1)
 
 
