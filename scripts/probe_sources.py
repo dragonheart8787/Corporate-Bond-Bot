@@ -74,7 +74,7 @@ class Source:
     url: str
 
 
-def validate_url(url: str) -> Tuple[bool, str]:
+def validate_url(url: str, allowed: Optional[set] = None) -> Tuple[bool, str]:
     """只接受 https、白名單主機、無帳密、無自訂埠。回傳 (合法?, 原因)。"""
     try:
         u = urllib.parse.urlparse(url or "")
@@ -86,7 +86,7 @@ def validate_url(url: str) -> Tuple[bool, str]:
         return False, "網址不得含帳號密碼"
     if u.port not in (None, 443):
         return False, "不允許自訂連接埠"
-    if (u.hostname or "").lower() not in ALLOWED_HOSTS:
+    if (u.hostname or "").lower() not in (ALLOWED_HOSTS if allowed is None else allowed):
         return False, f"主機 {u.hostname!r} 不在白名單"
     return True, ""
 
@@ -146,9 +146,9 @@ def _hint(status: int) -> str:
     return ""
 
 
-def fetch_once(url: str, ua: str, opener: Optional[Any] = None) -> FetchResult:
+def fetch_once(url: str, ua: str, opener: Optional[Any] = None, accept: Optional[str] = None) -> FetchResult:
     opener = opener or default_opener()
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": ua, "Accept": "application/json, text/csv;q=0.9, */*;q=0.5"})
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": ua, "Accept": accept or "application/json, text/csv;q=0.9, */*;q=0.5"})
     res = FetchResult()
     try:
         with opener.open(req, timeout=TIMEOUT_SEC) as resp:
