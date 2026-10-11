@@ -23,6 +23,7 @@ from telegram_date_utils import (
     filter_rows_today,
     report_yyyymmdd,
 )
+from issuance_progress import ProgressError, ProgressStore, format_progress_block, format_summary_lines
 
 _TW = TW
 
@@ -35,6 +36,11 @@ def safe_print(msg: str):
 
 class CompleteFormatter:
     def __init__(self):
+        # 發行進度（見 issuance_progress.py）。由 main() 載入後指定；None = 不顯示（單元測試與舊呼叫端不受影響）。
+        # progress_error 非空代表追蹤失敗，區塊會明講「追蹤功能異常」，而不是靜默少一塊。
+        self.progress = None
+        self.progress_error = ""
+        self.progress_note = ""   # 進度已算出但寫檔失敗時的提醒（不影響顯示，但使用者要知道不會被保留）
         # 轉換公司債相關關鍵字
         # 轉換公司債判定：加權與語境
         self.cb_strong_kw = ['可轉債', '轉換公司債', '可轉換公司債', '轉債']
@@ -238,6 +244,13 @@ class CompleteFormatter:
             if analysis['Neutral']:
                 result.append(f"  ℹ 中性：{'; '.join(analysis['Neutral'])}")
         
+        # 發行進度：只放在轉換公司債區塊（/cb、/all、日報都會經過這裡）
+        if category == '轉換公司債' and (self.progress is not None or self.progress_error):
+            result.append("")
+            result.extend(format_progress_block(self.progress, text, self.progress_error))
+            if self.progress_note:
+                result.append("  ⚠️ 進度紀錄寫入失敗，這次累積的進度不會被保留（見 Actions log）")
+        
         result.append("=" * 80)
         result.append("")
         
@@ -385,6 +398,28 @@ def main():
     if dropped > 0:
         safe_print("ℹ️ 若排除數很多，請檢查 auto_telegram_daily 是否曾用「不限日期」覆寫今日 CSV")
     
+    # 發行進度：載入 reports/issuance_progress.json → 累積今日公告 → 存回。
+    # 存檔由 daily.yml 既有的「git add reports/」一起提交；bot 端的 runner 沒有提交權限，只是用來即時顯示。
+    # 任何一步失敗都要明確報錯，且不能拖垮日報本身。
+    try:
+        store = ProgressStore.load()
+        store.apply_rows(rows)
+        for line in store.logs:
+            safe_print(line)
+        safe_print(f"📈 發行進度：{len(store.targets)} 檔追蹤中，本次統計 {store.stats or '無變動'}")
+        formatter.progress = store
+        try:
+            store.save()
+        except ProgressError as e:
+            safe_print(f"::error title=發行進度紀錄寫入失敗::{e}（日報照常產出，但這次累積的進度不會被保留）")
+            formatter.progress_note = str(e)
+        if store.load_error:
+            safe_print(f"::error title=發行進度紀錄檔損毀::{store.load_error}")
+    except Exception as e:  # 解析 bug 不能讓日報整份消失
+        safe_print(f"::error title=發行進度追蹤失敗::{type(e).__name__}: {e}")
+        formatter.progress = None
+        formatter.progress_error = f"{type(e).__name__}"
+
     # 檢查轉換公司債相關公告
     convertible_bond_count = sum(1 for row in rows if formatter.is_convertible_bond_related(row.get('text', '')))
     safe_print(f"🔥 發現 {convertible_bond_count} 則轉換公司債相關公告")
@@ -442,6 +477,11 @@ def main():
                     f.write(f"  ❗ 負向：{'; '.join(buckets['Negative'])}\n")
                 if buckets['Neutral']:
                     f.write(f"  ℹ 中性：{'; '.join(buckets['Neutral'])}\n")
+                # 該公司追蹤中的可轉債發行進度（沒有就不寫，這個檔案是彙總，不逐檔宣告「未偵測到」）
+                if formatter.progress is not None:
+                    for summ in formatter.progress.summaries_for_company(company_key.split(' ', 1)[0]):
+                        for line in format_summary_lines(summ):
+                            f.write(line + "\n")
                 f.write("-" * 40 + "\n")
     safe_print(f"🧠 公司研判彙總：{insights_path}")
     
