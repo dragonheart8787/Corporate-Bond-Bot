@@ -41,6 +41,7 @@ class CompleteFormatter:
         self.progress = None
         self.progress_error = ""
         self.progress_note = ""   # 進度已算出但寫檔失敗時的提醒（不影響顯示，但使用者要知道不會被保留）
+        self.progress_warning = ""   # 資料可能不全時的一行警示（來源只有標題、進度紀錄缺日），放在轉換公司債區段開頭
         # 轉換公司債相關關鍵字
         # 轉換公司債判定：加權與語境
         self.cb_strong_kw = ['可轉債', '轉換公司債', '可轉換公司債', '轉債']
@@ -285,6 +286,8 @@ class CompleteFormatter:
         if convertible_bond_announcements:
             result.append("🔥 轉換公司債相關公告（優先顯示）")
             result.append("=" * 60)
+            if self.progress_warning:
+                result.append(self.progress_warning)
             result.append("")
             
             for i, row in enumerate(convertible_bond_announcements, 1):
@@ -404,6 +407,11 @@ def main():
     try:
         store = ProgressStore.load()
         store.apply_rows(rows)
+        store.mark_processed(today, len(rows))
+        title_only = not any("說明：" in str(r.get("text", "")) for r in rows)
+        formatter.progress_warning = store.coverage_line(today, title_only)
+        if formatter.progress_warning:
+            safe_print(formatter.progress_warning)
         for line in store.logs:
             safe_print(line)
         safe_print(f"📈 發行進度：{len(store.targets)} 檔追蹤中，本次統計 {store.stats or '無變動'}")

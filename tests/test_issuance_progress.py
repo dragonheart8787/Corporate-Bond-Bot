@@ -14,6 +14,8 @@ import shutil
 import tempfile
 import time
 import unittest
+from datetime import date as datetime_date
+from datetime import timedelta as datetime_td
 from unittest import mock
 
 import issuance_progress as ip
@@ -135,7 +137,8 @@ class TestNodeDetection(unittest.TestCase):
     def test_real_titles_detect_node_without_date(self):
         real = {
             "board": "本公司董事會決議發行國內第五次無擔保轉換公司債",
-            "issue": "公告本公司國內第六次無擔保轉換公司債收足債款",
+            "paid": "公告本公司國內第六次無擔保轉換公司債收足債款",
+            "pricing": "公告本公司國內第二次無擔保轉換公司債完成訂價",
         }
         for kind, body in real.items():
             ev, _ = dates_of(body)
@@ -198,7 +201,7 @@ class TestNodeDetection(unittest.TestCase):
     def test_historical_narrative_in_title_does_not_become_a_new_node(self):
         # 「補充115/8/11公告」只是引用舊公告，日期不是這次的節點日期
         ev, ex = dates_of("（補充115/8/11公告）本公司董事會決議發行國內第一次暨第二次無擔保轉換公司債(變更發行額度)")
-        self.assertEqual(ev["board"], None)
+        self.assertNotIn("board", ev)                      # 變更發行額度類：不計為董事會決議節點（見 TestAdjustments）
         self.assertEqual(ex.ref_dates, ["2026-08-11"])
         ev2, ex2 = dates_of("更正115年8月11日之公告，本公司董事會決議發行國內第一次無擔保轉換公司債")
         self.assertIsNone(ev2["board"])
@@ -208,6 +211,176 @@ class TestNodeDetection(unittest.TestCase):
             ev3, ex3 = dates_of(f"{lead}115年8月11日所發布之公告，本公司董事會決議發行國內第一次無擔保轉換公司債")
             self.assertIsNone(ev3["board"], lead)
             self.assertEqual(ex3.ref_dates, ["2026-08-11"], lead)
+
+
+class TestAdjustments(unittest.TestCase):
+    """2026-10 調整：收足債款不再算發行；新增完成訂價；變更發行額度不算董事會決議；資料可能不全的警示。"""
+
+    def store(self):
+        return ProgressStore(os.path.join(tempfile.mkdtemp(), "p.json"))
+
+    def target(self, s, key="9999:國內第2次"):
+        return ip.summarize_target(key, s.targets[key])
+
+    # ── a. 收足債款 ──
+    def test_paid_up_is_not_the_issue_node(self):
+        for body in ("公告本公司國內第二次無擔保轉換公司債收足債款", "公告本公司國內第二次無擔保轉換公司債收足應募價款",
+                     "公告本公司國內第二次有擔保轉換公司債收足應募債款"):
+            ev, _ = dates_of(body)
+            self.assertEqual(ev, {"paid": None}, body)
+            self.assertNotIn("issue", ev, body)
+
+    def test_paid_up_never_moves_the_stage_or_creates_missing_nodes(self):
+        s = self.store()
+        s.apply_row(row("9999", "測試", "董事會於115年10月9日決議發行國內第二次無擔保轉換公司債", stamp="20261009 10:00:00"))
+        s.apply_row(row("9999", "測試", "國內第二次無擔保轉換公司債收足債款日:115年10月30日", stamp="20261030 10:00:00"))
+        m = self.target(s)
+        self.assertEqual(m.nodes["paid"]["date"], "2026-10-30")      # 日期照樣累積
+        self.assertEqual(m.stage_kind, "board")                      # 但階段仍停在董事會
+        self.assertEqual(m.missing_before_stage, [])
+        self.assertIsNone(m.nodes["issue"]["date"])
+        text = "\n".join(ip.format_summary_lines(m))
+        self.assertIn("目前階段：董事會決議日", text)
+        self.assertNotIn("資料不全", text)
+
+    def test_issue_date_label_still_means_issue(self):
+        ev, _ = dates_of("公告本公司國內第二次無擔保轉換公司債，發行日:115年10月30日")
+        self.assertEqual(ev, {"issue": "2026-10-30"})
+
+    # ── b. 完成訂價 ──
+    def test_pricing_node_detected_with_and_without_date(self):
+        ev, _ = dates_of("公告本公司國內第二次無擔保轉換公司債完成訂價")
+        self.assertEqual(ev, {"pricing": None})
+        ev, _ = dates_of("公告本公司國內第二次無擔保轉換公司債，訂價日:115年10月12日")
+        self.assertEqual(ev, {"pricing": "2026-10-12"})
+        ev, _ = dates_of("公告本公司發行國內第三次無擔保轉換公司債完成訂價及代收價款及存儲專戶行庫")
+        self.assertEqual(ev, {"pricing": None})          # 代收價款行庫不是節點
+
+    def test_pricing_is_shown_but_does_not_affect_stage(self):
+        s = self.store()
+        s.apply_row(row("9999", "測試", "國內第二次無擔保轉換公司債，完成訂價日:115年10月12日", stamp="20261012 10:00:00"))
+        m = self.target(s)
+        self.assertEqual(m.nodes["pricing"]["date"], "2026-10-12")
+        self.assertIsNone(m.stage_kind)
+        text = "\n".join(ip.format_summary_lines(m))
+        self.assertIn("訂價 2026-10-12", text)
+        self.assertIn("目前階段：未偵測到", text)
+
+    def test_pricing_undated_is_listed_as_announced_without_date(self):
+        s = self.store()
+        s.apply_row(row("9999", "測試", "公告本公司國內第二次無擔保轉換公司債完成訂價"))
+        text = "\n".join(ip.format_summary_lines(self.target(s)))
+        self.assertIn("訂價 未偵測到", text)
+        self.assertIn("已有公告但日期未揭露：完成訂價日", text)
+
+    def test_info_nodes_line_always_present_and_fail_closed(self):
+        s = self.store()
+        s.apply_row(row("9999", "測試", "董事會於115年10月9日決議發行國內第二次無擔保轉換公司債"))
+        text = "\n".join(ip.format_summary_lines(self.target(s)))
+        self.assertIn("其他節點（不影響階段）：訂價 未偵測到｜收足債款 未偵測到", text)
+
+    def test_negated_or_terminated_pricing_and_paid_are_not_nodes(self):
+        for body in ("公告本公司國內第二次無擔保轉換公司債取消訂價", "公告本公司國內第二次無擔保轉換公司債終止收足債款"):
+            ev, _ = dates_of(body)
+            self.assertEqual(ev, {}, body)
+
+    # ── c. (補充)…變更發行額度 ──
+    def test_supplement_changing_issue_amount_is_not_a_board_resolution(self):
+        real = "（補充115/8/11公告）本公司董事會決議發行國內第一次暨第二次無擔保轉換公司債(變更發行額度)"
+        ev, ex = dates_of(real)
+        self.assertEqual(ev, {})
+        self.assertEqual(ex.ref_dates, ["2026-08-11"])
+        self.assertTrue(any("修訂先前決議" in n for n in ex.notes))
+        s = self.store()
+        s.apply_row(row("3706", "神達", "（補充115/8/11公告）本公司董事會決議發行國內第一次暨第二次無擔保轉換公司債(變更發行額度)"))
+        self.assertEqual(s.targets, {})                   # 連 evidence 也不建
+
+    def test_other_amendment_wordings_and_dated_variant(self):
+        for body in ("本公司董事會決議變更國內第二次無擔保轉換公司債發行額度",
+                     "（更正）本公司董事會決議調整國內第二次無擔保轉換公司債發行條件",
+                     "本公司董事會於115年10月9日決議修正國內第二次無擔保轉換公司債發行辦法",
+                     "本公司董事會決議國內第二次無擔保轉換公司債增加發行金額"):
+            ev, _ = dates_of(body)
+            self.assertNotIn("board", ev, body)
+
+    def test_plain_supplement_or_correction_of_a_real_resolution_still_counts(self):
+        for body in ("(補充公告)本公司董事會決議發行國內第一次無擔保轉換公司債",
+                     "(更正)公告本公司董事會決議發行國內第二次無擔保轉換公司債案"):
+            ev, _ = dates_of(body)
+            self.assertIn("board", ev, body)
+
+    def test_amendment_does_not_overwrite_an_existing_board_date(self):
+        s = self.store()
+        s.apply_row(row("9999", "測試", "董事會於115年10月9日決議發行國內第二次無擔保轉換公司債", stamp="20261009 10:00:00"))
+        s.apply_row(row("9999", "測試", "(補充115/10/9公告)董事會於115年10月20日決議變更國內第二次無擔保轉換公司債發行額度", stamp="20261020 10:00:00"))
+        m = self.target(s)
+        self.assertEqual(m.nodes["board"]["date"], "2026-10-09")
+        self.assertFalse(m.nodes["board"]["conflict"])
+
+    # ── d. 資料可能不全 ──
+    def test_coverage_title_only_source(self):
+        s = self.store()
+        s.mark_processed("20261011", 8)
+        line = s.coverage_line("20261011", title_only=True)
+        self.assertTrue(line.startswith("⚠️ 資料可能不全："))
+        self.assertIn("來源只有公告標題", line)
+        self.assertIn("紀錄自 2026-10-11 起累積", line)
+        self.assertEqual(line.count("\n"), 0)            # 一行
+
+    def test_coverage_no_warning_when_source_has_body_and_no_gap(self):
+        s = self.store()
+        s.mark_processed("20261010", 5)
+        s.mark_processed("20261011", 5)
+        self.assertEqual(s.coverage_line("20261011", title_only=False), "")
+
+    def test_coverage_detects_days_the_daily_did_not_run(self):
+        s = self.store()
+        s.mark_processed("20261006", 5)
+        s.mark_processed("20261011", 5)                  # 10/07~10/10 沒處理
+        line = s.coverage_line("20261011", title_only=False)
+        self.assertIn("缺 10/07、10/08、10/09、10/10 共 4 天", line)
+        self.assertIn("當天 daily 未執行", line)
+
+    def test_coverage_gap_listing_is_truncated(self):
+        s = self.store()
+        s.mark_processed("20261001", 5)
+        line = s.coverage_line("20261011", title_only=False)
+        self.assertIn("等 9 天", line)
+
+    def test_coverage_consecutive_days_have_no_gap(self):
+        s = self.store()
+        for d in ("20261008", "20261009", "20261010"):
+            s.mark_processed(d, 3)
+        self.assertEqual(s.coverage_line("20261011", title_only=False), "")
+
+    def test_zero_row_day_is_not_marked_so_the_gap_stays_visible(self):
+        s = self.store()
+        s.mark_processed("20261009", 5)
+        self.assertFalse(s.mark_processed("20261010", 0))
+        s.mark_processed("20261011", 5)
+        self.assertIn("缺 10/10 共 1 天", s.coverage_line("20261011", title_only=False))
+
+    def test_mark_processed_rejects_bad_dates_and_is_idempotent(self):
+        s = self.store()
+        self.assertFalse(s.mark_processed("2026-10-11", 5))
+        self.assertTrue(s.mark_processed("20261011", 5))
+        s.mark_processed("20261011", 5)
+        self.assertEqual(s.data["processed_dates"], ["20261011"])
+
+    def test_processed_dates_survive_restart_and_are_capped(self):
+        s = self.store()
+        base = datetime_date(2026, 1, 1)
+        for i in range(150):
+            s.mark_processed((base + datetime_td(days=i)).strftime("%Y%m%d"), 1)
+        self.assertEqual(len(s.data["processed_dates"]), ProgressStore.PROCESSED_KEEP)
+        s.save()
+        self.assertEqual(ProgressStore.load(s.path).data["processed_dates"], s.data["processed_dates"])
+
+    def test_report_date_not_wall_clock_decides_the_gap(self):
+        s = self.store()
+        s.mark_processed("20261009", 5)
+        # 台北凌晨回退時 report_date 是前一天：10/10 在報告日期之後，不算缺
+        self.assertEqual(s.coverage_line("20261010", title_only=False), "")
 
 
 class TestMultipleDatesInOneAnnouncement(unittest.TestCase):
@@ -718,6 +891,44 @@ class TestFormatterIntegration(unittest.TestCase):
         with mock.patch.dict(os.environ, {"REPORT_DATE": "20261009"}):
             out = bl.filter_cb_only(self.report(s))
         self.assertIn("送件日：2026-10-15", out)
+
+    def test_warning_line_sits_under_cb_header_once_and_survives_filters(self):
+        import main as m
+        import bot_listener as bl
+        s = ProgressStore(os.path.join(self.tmp, "p.json"))
+        s.apply_rows(self.rows)
+        f = self.cf.CompleteFormatter()
+        f.progress = s
+        f.progress_warning = "⚠️ 資料可能不全：來源只有公告標題（無內文），節點日期多半無法取得"
+        rep = f.format_with_convertible_bond_priority(self.rows)
+        self.assertEqual(rep.count("資料可能不全"), 1)
+        head, _, tail = rep.partition("🔥 轉換公司債相關公告（優先顯示）\n" + "=" * 60 + "\n")
+        self.assertTrue(tail.startswith("⚠️ 資料可能不全"))
+        with mock.patch.dict(os.environ, {"REPORT_DATE": "20261009"}):
+            self.assertIn("資料可能不全", m.filter_cb_only(rep))
+            self.assertIn("資料可能不全", bl.filter_cb_only(rep))
+
+    def test_no_warning_line_when_not_needed(self):
+        rep = self.report(ProgressStore(os.path.join(self.tmp, "p.json")))
+        self.assertNotIn("資料可能不全", rep)
+
+    def test_end_to_end_titles_only_source_prints_warning_and_marks_day(self):
+        rep, log = self._run_main(self.rows)
+        self.assertIn("資料可能不全：來源只有公告標題", rep)
+        data = json.load(open(os.path.join(self.tmp, "reports", "issuance_progress.json")))
+        self.assertEqual(data["processed_dates"], ["20261009"])
+
+    def test_end_to_end_detects_missing_daily(self):
+        os.makedirs(os.path.join(self.tmp, "reports"))
+        with open(os.path.join(self.tmp, "reports", "issuance_progress.json"), "w") as f:
+            json.dump({"version": 1, "updated_at": None, "processed_dates": ["20261005"], "targets": {}}, f)
+        rep, _ = self._run_main(self.rows)
+        self.assertIn("缺 10/06、10/07、10/08 共 3 天", rep)
+
+    def test_end_to_end_body_text_source_has_no_titles_only_warning(self):
+        rows = [dict(r, text=r["text"] + " 說明：1.事實發生日:115/10/9") for r in self.rows]
+        rep, _ = self._run_main(rows)
+        self.assertNotIn("來源只有公告標題", rep)
 
     def test_save_note_is_shown(self):
         s = ProgressStore(os.path.join(self.tmp, "p.json"))

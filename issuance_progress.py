@@ -67,12 +67,19 @@ DEFAULT_STORE_PATH = os.path.join("reports", "issuance_progress.json")
 
 # 流程順序（也是推導「目前階段」的順序）
 NODE_ORDER = ["board", "filing", "effective", "auction", "issue", "listing"]
+# 資訊節點：會顯示、會累積日期與證據，但「不參與階段推導，也不算資料不全」。
+#   pricing 完成訂價：它在流程中的先後（競拍前或後）沒有資料可驗證，先不排進階段順序。
+#   paid    收足債款：只代表款項收足的公告，不等於發行日（原本誤歸入 issue，已拆出）。
+INFO_NODES = ["pricing", "paid"]
+ALL_NODES = NODE_ORDER + INFO_NODES
 NODE_LABEL = {
     "board": "董事會決議日",
     "filing": "送件日",
     "effective": "申報生效日",
     "auction": "競價拍賣日",
     "issue": "發行日",
+    "pricing": "完成訂價日",
+    "paid": "收足債款日",
     "listing": "上櫃日",
 }
 NODE_SHORT = {
@@ -81,6 +88,8 @@ NODE_SHORT = {
     "effective": "生效",
     "auction": "競拍",
     "issue": "發行",
+    "pricing": "訂價",
+    "paid": "收足債款",
     "listing": "上櫃",
 }
 NOT_DETECTED = "未偵測到"
@@ -249,7 +258,9 @@ _NODE_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
     ("effective", re.compile(r"(?:" + _AGENCY + r"[^,。;\n]{0,6}?)?(?:核准|核可|同意)(?:生效|申報|募集|發行|日期|日)")),
     ("auction", re.compile(r"競價拍賣|公開競價|競拍|公開承銷|詢價圈購|競標|標售|拍賣日|投標日|開標日")),
     ("issue", re.compile(r"發行日期|發行日|債券發行日")),
-    ("issue", re.compile(r"(?:收足|募足)(?:應募)?(?:債款|價款|款項)|完成募集|募集完成|發行完成")),
+    ("issue", re.compile(r"發行完成")),
+    ("paid", re.compile(r"(?:收足|募足)(?:應募)?(?:債款|價款|款項)(?:日期|日)?[::]?(?:為|於)?|完成募集|募集完成")),
+    ("pricing", re.compile(r"完成訂價|完成定價|訂價完成|定價完成|(?:訂價|定價)(?:日期|日)[::]?(?:為|於)?")),
     ("listing", re.compile(r"上櫃(?:買賣)?(?:開始)?日期|上櫃(?:買賣)?(?:開始)?日|開始(?:上櫃|櫃檯買賣|櫃買)|掛牌(?:上櫃|日期|日)|核准上櫃|上櫃掛牌|櫃檯買賣開始日")),
 ]
 
@@ -265,9 +276,15 @@ _EXCLUDE_NEAR = {
     "effective": re.compile(r"延長|展延|延期|修正|辦法|條款|調整|變更|撤銷|終止|解除|辭任"),
     "listing": re.compile(r"終止"),
     "issue": re.compile(r"終止"),
+    "pricing": re.compile(r"終止|取消"),
+    "paid": re.compile(r"終止|取消"),
     "auction": re.compile(r"終止|取消"),
     "board": re.compile(r"$^"),
 }
+# 變更發行額度／條件／價格…：是在修訂先前已決議的案子（例如「(補充115/8/11公告)…董事會決議發行…(變更發行額度)」）
+_BOARD_AMEND_RE = re.compile(
+    r"(?:變更|調整|修正|修訂|增加|減少|追加|提高|降低)[^,。;]{0,30}?(?:額度|總額|金額|條件|辦法|張數|規模)"
+)
 # 否定／取消：這則公告在說「沒有發生」，不能當節點證據
 _NEGATE_RE = re.compile(r"取消|撤銷|撤回|廢止|不再|否決|未通過|未獲|不予|駁回|終止發行|終止辦理")
 
@@ -412,7 +429,12 @@ def extract_events(text: str) -> Extraction:
         slot = by_kind.setdefault(st["kind"], {"dates": [], "kw": masked[st["s"]:st["e"]]})
         slot["dates"].extend(st["dates"])
 
-    for kind in NODE_ORDER:
+    # 董事會決議的「補充／變更發行額度」類標題：是對先前決議的修訂，不是一次新的董事會決議節點
+    if "board" in by_kind and _BOARD_AMEND_RE.search(norm):
+        ex.notes.append("董事會決議字樣出自「變更發行額度／條件」類公告，是修訂先前決議，不計為董事會決議節點")
+        del by_kind["board"]
+
+    for kind in ALL_NODES:
         slot = by_kind.get(kind)
         if not slot:
             continue
@@ -633,7 +655,7 @@ class Summary:
 
 def summarize_target(key: str, target: Dict[str, Any]) -> Summary:
     nodes: Dict[str, Dict[str, Any]] = {}
-    for kind in NODE_ORDER:
+    for kind in ALL_NODES:
         raw = target.get("nodes", {}).get(kind, {"history": [], "evidence": []})
         d = derive_node(raw)
         d["evidence_n"] = len(raw.get("evidence", []))
@@ -643,7 +665,7 @@ def summarize_target(key: str, target: Dict[str, Any]) -> Summary:
     missing: List[str] = []
     if stage:
         missing = [k for k in NODE_ORDER[:NODE_ORDER.index(stage)] if not nodes[k]["date"]]
-    undated = [k for k in NODE_ORDER if not nodes[k]["date"] and nodes[k]["evidence_n"] > 0]
+    undated = [k for k in ALL_NODES if not nodes[k]["date"] and nodes[k]["evidence_n"] > 0]
     return Summary(
         key=key,
         name=target.get("name", ""),
@@ -661,7 +683,7 @@ class ProgressStore:
 
     def __init__(self, path: str = DEFAULT_STORE_PATH):
         self.path = path
-        self.data: Dict[str, Any] = {"version": STORE_VERSION, "updated_at": None, "targets": {}}
+        self.data: Dict[str, Any] = {"version": STORE_VERSION, "updated_at": None, "processed_dates": [], "targets": {}}
         self.logs: List[str] = []
         self.stats: Dict[str, int] = {}
         self.load_error: str = ""
@@ -686,6 +708,7 @@ class ProgressStore:
                 raise ValueError("結構不符（缺 targets）")
             if data.get("version") != STORE_VERSION:
                 raise ValueError(f"版本 {data.get('version')!r} 不是 {STORE_VERSION}")
+            data.setdefault("processed_dates", [])
             store.data = data
         except (OSError, ValueError) as e:
             # 絕不在這裡直接覆蓋壞檔：先備份，之後 save 才不會把唯一的資料蓋掉
@@ -804,6 +827,54 @@ class ProgressStore:
         for row in rows:
             self.apply_row(row)
 
+    # ── 涵蓋範圍（資料可能不全的判斷）──
+    PROCESSED_KEEP = 120
+
+    def mark_processed(self, report_date: str, row_count: int) -> bool:
+        """
+        記下「這個報告日期的公告已納入」。0 則公告不記：頻道當天不可能完全沒有公告，0 則多半是抓取失敗，
+        記下去會把缺口藏起來（fail-closed：寧可顯示缺口）。
+        """
+        if row_count <= 0 or not re.fullmatch(r"\d{8}", report_date or ""):
+            return False
+        days = set(self.data.get("processed_dates", []))
+        days.add(report_date)
+        self.data["processed_dates"] = sorted(days)[-self.PROCESSED_KEEP:]
+        return True
+
+    def coverage_line(self, report_date: str, title_only: bool) -> str:
+        """
+        資料可能不全時回傳「一行」警示，否則回空字串。原因（可並列）：
+          - 來源只有標題：這批公告沒有任何「說明：」內文，節點日期多半抓不到。
+          - 進度紀錄有缺日：上次處理的日期到 report_date 之間有天數沒納入（當天 daily 未執行、抓取失敗或沒存檔）。
+        """
+        reasons: List[str] = []
+        if title_only:
+            reasons.append("來源只有公告標題（無內文），節點日期多半無法取得")
+        days = sorted(set(self.data.get("processed_dates", [])))
+        prior = [d for d in days if d < report_date]
+        missing: List[str] = []
+        if prior:
+            try:
+                cur = datetime.strptime(prior[-1], "%Y%m%d").date()
+                end = datetime.strptime(report_date, "%Y%m%d").date()
+                while True:
+                    cur = cur.fromordinal(cur.toordinal() + 1)
+                    if cur >= end:
+                        break
+                    if cur.strftime("%Y%m%d") not in days:
+                        missing.append(cur.strftime("%m/%d"))
+            except ValueError:
+                pass
+        if missing:
+            shown = "、".join(missing[:5]) + (f" 等 {len(missing)} 天" if len(missing) > 5 else f" 共 {len(missing)} 天")
+            reasons.append(f"進度紀錄缺 {shown}（當天 daily 未執行或沒存檔），期間公告未納入")
+        if not reasons:
+            return ""
+        since = days[0] if days else report_date
+        reasons.append(f"紀錄自 {since[:4]}-{since[4:6]}-{since[6:]} 起累積，更早的公告未納入")
+        return "⚠️ 資料可能不全：" + "；".join(reasons)
+
     # ── 查詢 ──
     def summaries_for(self, row_text: str) -> Tuple[List[Summary], str]:
         """這則公告對應的標的進度。回傳 (summaries, 原因)；沒有時 summaries 為空、原因說明為何。"""
@@ -843,7 +914,9 @@ def format_summary_lines(s: Summary) -> List[str]:
     lines.append(f"  送件日：{s.nodes['filing']['date'] or NOT_DETECTED}")
     others = [f"{NODE_SHORT[k]} {s.nodes[k]['date'] or NOT_DETECTED}" for k in NODE_ORDER if k != "filing"]
     lines.append("  節點：" + "｜".join(others))
-    conflicts = [NODE_LABEL[k] for k in NODE_ORDER if s.nodes[k]["conflict"]]
+    info = [f"{NODE_SHORT[k]} {s.nodes[k]['date'] or NOT_DETECTED}" for k in INFO_NODES]
+    lines.append("  其他節點（不影響階段）：" + "｜".join(info))
+    conflicts = [NODE_LABEL[k] for k in ALL_NODES if s.nodes[k]["conflict"]]
     if conflicts:
         lines.append("  ⚠️ 日期曾被更正／衝突（已採較新公告）：" + "、".join(conflicts))
     if s.undated_evidence:
