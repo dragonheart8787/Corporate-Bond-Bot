@@ -58,6 +58,8 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+          # 目錄可能不存在（dry_run、或所有來源都失敗而什麼都沒寫）：git add 對不存在的路徑會直接 fatal
+          mkdir -p data/announcements
           git add data/announcements
           if git diff --staged --quiet; then
             echo "無變更，略過 commit"
