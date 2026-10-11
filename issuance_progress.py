@@ -65,6 +65,23 @@ TW = ZoneInfo("Asia/Taipei")
 STORE_VERSION = 1
 DEFAULT_STORE_PATH = os.path.join("reports", "issuance_progress.json")
 
+
+def status_lines(path: Optional[str] = None) -> List[str]:
+    """/status 的發行進度區塊。讀不到、壞檔都回明確的一行，絕不丟例外（/status 不能被它拖垮）。"""
+    p = path or os.environ.get("ISSUANCE_PROGRESS_PATH") or DEFAULT_STORE_PATH
+    if not os.path.exists(p):
+        return ["📈 發行進度：尚無進度紀錄檔（daily 還沒產生過）"]
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("targets"), dict):
+            raise ValueError("結構不符")
+        store = ProgressStore(p)
+        store.data = data
+        return store.status_lines()
+    except (OSError, ValueError) as e:
+        return [f"📈 發行進度：⚠️ 進度紀錄檔無法讀取（{type(e).__name__}）"]
+
 # 流程順序（也是推導「目前階段」的順序）
 NODE_ORDER = ["board", "filing", "effective", "auction", "issue", "listing"]
 # 資訊節點：會顯示、會累積日期與證據，但「不參與階段推導，也不算資料不全」。
@@ -842,15 +859,18 @@ class ProgressStore:
         self.data["processed_dates"] = sorted(days)[-self.PROCESSED_KEEP:]
         return True
 
-    def coverage_line(self, report_date: str, title_only: bool) -> str:
+    def set_last_run(self, report_date: str, row_count: int, title_only: bool) -> None:
+        """記下最近一次處理的概況，供 /status 顯示（不放進日報）。0 則公告時不更新，避免把「抓取失敗」記成「沒有內文」。"""
+        if row_count <= 0:
+            return
+        self.data["last_run"] = {"report_date": report_date, "rows": row_count, "title_only": bool(title_only)}
+
+    def coverage_line(self, report_date: str) -> str:
         """
-        資料可能不全時回傳「一行」警示，否則回空字串。原因（可並列）：
-          - 來源只有標題：這批公告沒有任何「說明：」內文，節點日期多半抓不到。
-          - 進度紀錄有缺日：上次處理的日期到 report_date 之間有天數沒納入（當天 daily 未執行、抓取失敗或沒存檔）。
+        進度紀錄「真的有缺日」才回傳一行警示，否則回空字串：上次處理的日期到 report_date 之間，
+        有天數沒納入（當天 daily 未執行、抓取失敗或沒存檔）。
+        「來源只有標題」是資料來源的固定限制，不在這裡報（改放 /status，見 status_lines）。
         """
-        reasons: List[str] = []
-        if title_only:
-            reasons.append("來源只有公告標題（無內文），節點日期多半無法取得")
         days = sorted(set(self.data.get("processed_dates", [])))
         prior = [d for d in days if d < report_date]
         missing: List[str] = []
@@ -866,14 +886,30 @@ class ProgressStore:
                         missing.append(cur.strftime("%m/%d"))
             except ValueError:
                 pass
-        if missing:
-            shown = "、".join(missing[:5]) + (f" 等 {len(missing)} 天" if len(missing) > 5 else f" 共 {len(missing)} 天")
-            reasons.append(f"進度紀錄缺 {shown}（當天 daily 未執行或沒存檔），期間公告未納入")
-        if not reasons:
+        if not missing:
             return ""
-        since = days[0] if days else report_date
-        reasons.append(f"紀錄自 {since[:4]}-{since[4:6]}-{since[6:]} 起累積，更早的公告未納入")
-        return "⚠️ 資料可能不全：" + "；".join(reasons)
+        shown = "、".join(missing[:5]) + (f" 等 {len(missing)} 天" if len(missing) > 5 else f" 共 {len(missing)} 天")
+        since = days[0]
+        return (
+            f"⚠️ 資料可能不全：進度紀錄缺 {shown}（當天 daily 未執行或沒存檔），期間公告未納入；"
+            f"紀錄自 {since[:4]}-{since[4:6]}-{since[6:]} 起累積，更早的公告未納入"
+        )
+
+    def status_lines(self) -> List[str]:
+        """/status 用：追蹤檔數、最近處理日，以及資料來源的限制（目前來源只有標題）。"""
+        lr = self.data.get("last_run") or {}
+        head = f"📈 發行進度：追蹤 {len(self.targets)} 檔"
+        if lr.get("report_date"):
+            d = lr["report_date"]
+            head += f"｜最近處理 {d[:4]}-{d[4:6]}-{d[6:]}（{lr.get('rows', 0)} 則公告）"
+        else:
+            head += "｜尚無處理紀錄"
+        lines = [head]
+        if lr.get("title_only", True):
+            lines.append("  ℹ 資料來源只有公告標題（無內文），節點日期多半無法取得，多數節點會顯示「未偵測到」")
+        if self.data.get("updated_at"):
+            lines.append(f"  紀錄檔更新於 {self.data['updated_at'][:19].replace('T', ' ')}（依 bot 啟動時的存檔）")
+        return lines
 
     # ── 查詢 ──
     def summaries_for(self, row_text: str) -> Tuple[List[Summary], str]:

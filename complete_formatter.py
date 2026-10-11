@@ -409,7 +409,8 @@ def main():
         store.apply_rows(rows)
         store.mark_processed(today, len(rows))
         title_only = not any("說明：" in str(r.get("text", "")) for r in rows)
-        formatter.progress_warning = store.coverage_line(today, title_only)
+        store.set_last_run(today, len(rows), title_only)
+        formatter.progress_warning = store.coverage_line(today)
         if formatter.progress_warning:
             safe_print(formatter.progress_warning)
         for line in store.logs:

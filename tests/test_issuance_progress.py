@@ -318,47 +318,50 @@ class TestAdjustments(unittest.TestCase):
         self.assertFalse(m.nodes["board"]["conflict"])
 
     # ── d. 資料可能不全 ──
-    def test_coverage_title_only_source(self):
+    def test_titles_only_source_does_not_trigger_the_report_warning(self):
+        # 「來源只有標題」是固定限制，改放 /status；日報與 /cb 只在真的缺日時才警示
         s = self.store()
         s.mark_processed("20261011", 8)
-        line = s.coverage_line("20261011", title_only=True)
-        self.assertTrue(line.startswith("⚠️ 資料可能不全："))
-        self.assertIn("來源只有公告標題", line)
-        self.assertIn("紀錄自 2026-10-11 起累積", line)
-        self.assertEqual(line.count("\n"), 0)            # 一行
+        s.set_last_run("20261011", 8, title_only=True)
+        self.assertEqual(s.coverage_line("20261011"), "")
 
-    def test_coverage_no_warning_when_source_has_body_and_no_gap(self):
+    def test_coverage_no_warning_when_no_gap(self):
         s = self.store()
         s.mark_processed("20261010", 5)
         s.mark_processed("20261011", 5)
-        self.assertEqual(s.coverage_line("20261011", title_only=False), "")
+        self.assertEqual(s.coverage_line("20261011"), "")
+        self.assertEqual(self.store().coverage_line("20261011"), "")      # 全新、尚無任何紀錄也不警示
 
     def test_coverage_detects_days_the_daily_did_not_run(self):
         s = self.store()
         s.mark_processed("20261006", 5)
         s.mark_processed("20261011", 5)                  # 10/07~10/10 沒處理
-        line = s.coverage_line("20261011", title_only=False)
+        line = s.coverage_line("20261011")
         self.assertIn("缺 10/07、10/08、10/09、10/10 共 4 天", line)
         self.assertIn("當天 daily 未執行", line)
+        self.assertIn("紀錄自 2026-10-06 起累積", line)
+        self.assertTrue(line.startswith("⚠️ 資料可能不全："))
+        self.assertEqual(line.count("\n"), 0)            # 一行
+        self.assertNotIn("來源只有公告標題", line)
 
     def test_coverage_gap_listing_is_truncated(self):
         s = self.store()
         s.mark_processed("20261001", 5)
-        line = s.coverage_line("20261011", title_only=False)
+        line = s.coverage_line("20261011")
         self.assertIn("等 9 天", line)
 
     def test_coverage_consecutive_days_have_no_gap(self):
         s = self.store()
         for d in ("20261008", "20261009", "20261010"):
             s.mark_processed(d, 3)
-        self.assertEqual(s.coverage_line("20261011", title_only=False), "")
+        self.assertEqual(s.coverage_line("20261011"), "")
 
     def test_zero_row_day_is_not_marked_so_the_gap_stays_visible(self):
         s = self.store()
         s.mark_processed("20261009", 5)
         self.assertFalse(s.mark_processed("20261010", 0))
         s.mark_processed("20261011", 5)
-        self.assertIn("缺 10/10 共 1 天", s.coverage_line("20261011", title_only=False))
+        self.assertIn("缺 10/10 共 1 天", s.coverage_line("20261011"))
 
     def test_mark_processed_rejects_bad_dates_and_is_idempotent(self):
         s = self.store()
@@ -380,7 +383,64 @@ class TestAdjustments(unittest.TestCase):
         s = self.store()
         s.mark_processed("20261009", 5)
         # 台北凌晨回退時 report_date 是前一天：10/10 在報告日期之後，不算缺
-        self.assertEqual(s.coverage_line("20261010", title_only=False), "")
+        self.assertEqual(s.coverage_line("20261010"), "")
+
+
+class TestStatusLines(unittest.TestCase):
+    """/status 顯示發行進度與「來源只有標題」的限制（不放進日報與 /cb）。"""
+
+    def make(self, title_only=True, rows=8):
+        tmp = tempfile.mkdtemp()
+        s = ProgressStore(os.path.join(tmp, "p.json"))
+        s.apply_row(row("9999", "測試", "董事會於115年10月9日決議發行國內第二次無擔保轉換公司債"))
+        s.mark_processed("20261011", rows)
+        s.set_last_run("20261011", rows, title_only)
+        s.save()
+        return s
+
+    def test_titles_only_limitation_is_shown(self):
+        s = self.make(True)
+        text = "\n".join(ip.status_lines(s.path))
+        self.assertIn("追蹤 1 檔", text)
+        self.assertIn("最近處理 2026-10-11（8 則公告）", text)
+        self.assertIn("資料來源只有公告標題", text)
+        self.assertIn("紀錄檔更新於", text)
+
+    def test_limitation_hidden_once_the_source_has_body_text(self):
+        text = "\n".join(ip.status_lines(self.make(False).path))
+        self.assertNotIn("只有公告標題", text)
+
+    def test_missing_unreadable_or_corrupt_file_never_raises(self):
+        tmp = tempfile.mkdtemp()
+        self.assertIn("尚無進度紀錄檔", ip.status_lines(os.path.join(tmp, "nope.json"))[0])
+        bad = os.path.join(tmp, "bad.json")
+        for payload in ("{ not json", "[]", '{"targets": 5}'):
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write(payload)
+            line = ip.status_lines(bad)[0]
+            self.assertIn("無法讀取", line, payload)
+        self.assertIn("無法讀取", ip.status_lines(tmp)[0])           # 路徑是目錄
+
+    def test_zero_row_run_does_not_flip_the_limitation_flag(self):
+        s = self.make(False)
+        s.set_last_run("20261012", 0, True)       # 抓取失敗的空跑，不能把「有內文」改成「只有標題」
+        self.assertFalse(s.data["last_run"]["title_only"])
+
+    def test_report_and_cb_never_mention_the_titles_only_limitation(self):
+        import complete_formatter as cf
+        s = self.make(True)
+        f = cf.CompleteFormatter()
+        f.progress = s
+        f.progress_warning = s.coverage_line("20261011")
+        rep = f.format_with_convertible_bond_priority([row("9999", "測試", "董事會於115年10月9日決議發行國內第二次無擔保轉換公司債")])
+        self.assertNotIn("只有公告標題", rep)
+        self.assertNotIn("資料可能不全", rep)
+
+    def test_status_command_in_bot_includes_progress_block(self):
+        import bot_listener as bl
+        s = self.make(True)
+        with mock.patch.dict(os.environ, {"ISSUANCE_PROGRESS_PATH": s.path}):
+            self.assertIn("資料來源只有公告標題", "\n".join(bl.progress_status_lines()))
 
 
 class TestMultipleDatesInOneAnnouncement(unittest.TestCase):
@@ -912,11 +972,13 @@ class TestFormatterIntegration(unittest.TestCase):
         rep = self.report(ProgressStore(os.path.join(self.tmp, "p.json")))
         self.assertNotIn("資料可能不全", rep)
 
-    def test_end_to_end_titles_only_source_prints_warning_and_marks_day(self):
+    def test_end_to_end_titles_only_source_has_no_report_warning_but_is_recorded_for_status(self):
         rep, log = self._run_main(self.rows)
-        self.assertIn("資料可能不全：來源只有公告標題", rep)
+        self.assertNotIn("資料可能不全", rep)
+        self.assertNotIn("只有公告標題", rep)
         data = json.load(open(os.path.join(self.tmp, "reports", "issuance_progress.json")))
         self.assertEqual(data["processed_dates"], ["20261009"])
+        self.assertEqual(data["last_run"], {"report_date": "20261009", "rows": 3, "title_only": True})
 
     def test_end_to_end_detects_missing_daily(self):
         os.makedirs(os.path.join(self.tmp, "reports"))
@@ -925,10 +987,11 @@ class TestFormatterIntegration(unittest.TestCase):
         rep, _ = self._run_main(self.rows)
         self.assertIn("缺 10/06、10/07、10/08 共 3 天", rep)
 
-    def test_end_to_end_body_text_source_has_no_titles_only_warning(self):
+    def test_end_to_end_body_text_source_is_recorded_as_not_titles_only(self):
         rows = [dict(r, text=r["text"] + " 說明：1.事實發生日:115/10/9") for r in self.rows]
-        rep, _ = self._run_main(rows)
-        self.assertNotIn("來源只有公告標題", rep)
+        self._run_main(rows)
+        data = json.load(open(os.path.join(self.tmp, "reports", "issuance_progress.json")))
+        self.assertFalse(data["last_run"]["title_only"])
 
     def test_save_note_is_shown(self):
         s = ProgressStore(os.path.join(self.tmp, "p.json"))

@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import bot_relay as relay
+from issuance_progress import status_lines as progress_status_lines
 from telegram_date_utils import report_yyyymmdd
 
 TW = timezone(timedelta(hours=8))
@@ -857,6 +858,7 @@ def main() -> int:
                 updated = get_report_updated_time(github_token, github_repo)
                 now_tw = datetime.now(TW).strftime("%Y-%m-%d %H:%M:%S")
                 uptime = int((time.time() - start_time) / 60)
+                progress_text = "\n".join(progress_status_lines())
                 send_message(
                     bot_token,
                     chat_id,
@@ -865,6 +867,7 @@ def main() -> int:
                     f"🕐 現在時間：{now_tw}\n"
                     f"⏱  已運行：{uptime} 分鐘\n"
                     f"📊 報告更新：{updated}\n"
+                    f"{progress_text}\n"
                     f"📡 即時抓取：{'已設定' if can_run_fetch() else '未設定（僅 GitHub）'}\n"
                     f"📅 自動排程：每日台北 18:23 起，另有 19:37／20:53／22:47 三班備援（GitHub 排程常延遲數小時，偶爾會整個略過，先成功的那班會發送、其餘略過）",
                 )

@@ -430,6 +430,39 @@ class TestReportCommandFailClosed(unittest.TestCase):
         self.assertFalse(any("這次不即時抓取" in t for t in sent))
 
 
+class TestStatusShowsIssuanceProgressNote(MainHarness):
+    def test_status_reply_contains_progress_block_with_titles_only_limitation(self):
+        import json
+        import tempfile
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "p.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "updated_at": "2026-10-11T18:30:49+08:00", "processed_dates": ["20261011"],
+                       "last_run": {"report_date": "20261011", "rows": 8, "title_only": True}, "targets": {}}, f)
+        code, out, handled, sent, _ = self.run_main(
+            [[], [upd(5, "/status", 0)]],
+            env_extra={"BOT_RELAY_ENABLED": "0", "ISSUANCE_PROGRESS_PATH": path},
+        )
+        status = [t for c, t in sent if "Bot 狀態" in t]
+        self.assertEqual(len(status), 1)
+        self.assertIn("📈 發行進度：追蹤 0 檔｜最近處理 2026-10-11（8 則公告）", status[0])
+        self.assertIn("資料來源只有公告標題", status[0])
+        self.assertIn("📊 報告更新", status[0])            # 既有欄位仍在
+
+    def test_status_still_replies_when_progress_file_is_broken(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "p.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ broken")
+        code, out, handled, sent, _ = self.run_main(
+            [[], [upd(5, "/status", 0)]], env_extra={"BOT_RELAY_ENABLED": "0", "ISSUANCE_PROGRESS_PATH": path}
+        )
+        status = [t for c, t in sent if "Bot 狀態" in t]
+        self.assertEqual(len(status), 1)
+        self.assertIn("無法讀取", status[0])
+
+
 class TestMainDedupeAndStartup(MainHarness):
     def test_same_update_id_delivered_twice_is_handled_once(self):
         # 第 1 批 = 啟動取回（空）；第 2、3 批 = 同一個 update_id 重複出現
