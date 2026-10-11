@@ -1,0 +1,58 @@
+name: 唯讀探測：公開資料來源（手動、只讀、不發訊息）
+
+# 目的：確認「有內文」的公開資料來源能否取得送件日／申報生效日／競拍日。
+# 只問結構：HTTP 狀態、回應大小、欄位名稱、筆數、日期欄位的最早／最晚、是否出現「送件」「申報生效」。
+# 不輸出任何內文，不寫入 repo，不使用任何 secrets，不碰 Telegram，不觸發其他 workflow。
+# 為什麼要在 GitHub runner 上測：日報實際就是在這裡跑；來源是否擋雲端 IP，只有從這裡打才知道。
+on:
+  workflow_dispatch:
+    inputs:
+      twse_url:
+        description: "證交所 OpenAPI「上市公司每日重大訊息」網址（留空用預設；主機須在白名單內）"
+        required: false
+        default: "https://openapi.twse.com.tw/v1/opendata/t187ap04_L"
+      tpex_url:
+        description: "櫃買中心 OpenAPI 對應資料集網址（留空用預設；也可改成 https://openapi.tpex.org.tw/...）"
+        required: false
+        default: "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O"
+      datagov_ids:
+        description: "政府資料開放平臺資料集編號，逗號分隔"
+        required: false
+        default: "11406,11407"
+      dry_run:
+        description: "true = 只驗證設定、印出將送出的請求，不連線"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# 只需要 checkout 的讀取權限。沒有 secrets、沒有 actions: write、沒有 contents: write。
+permissions:
+  contents: read
+
+concurrency:
+  group: probe-sources
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout（不保留 token）
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 輸入一律經由環境變數傳入（不直接插進 shell），腳本再自行驗證主機白名單。
+      - name: 🔎 探測（每來源一次 GET，間隔 ≥ 6 秒，不重試）
+        env:
+          PROBE_TWSE_URL: ${{ github.event.inputs.twse_url }}
+          PROBE_TPEX_URL: ${{ github.event.inputs.tpex_url }}
+          PROBE_DATAGOV_IDS: ${{ github.event.inputs.datagov_ids }}
+          PROBE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          PROBE_REPO: ${{ github.repository }}
+        run: python3 scripts/probe_sources.py
