@@ -10,6 +10,7 @@
 #   PUSH_ATTEMPTS      最多嘗試次數（預設 4）
 #   PUSH_RETRY_SLEEP   第 n 次失敗後等 n * 這個秒數（預設 3；測試設 0）
 #   PUSH_ALERT_CMD     告警指令（預設 python3 bot_relay.py alert；接收訊息作為最後一個參數）
+#   PUSH_FAIL_MESSAGE  最終失敗時的訊息（預設是每日報告的說明；其他 workflow 重用本腳本時請覆寫）
 set -u
 
 BRANCH="${PUSH_BRANCH:-${GITHUB_REF_NAME:-master}}"
@@ -35,7 +36,8 @@ for i in $(seq 1 "$ATTEMPTS"); do
   fi
 done
 
-MSG="每日報告已處理，但 reports/（含 .last_sent 防重發標記）推送失敗 ${ATTEMPTS} 次，下一班可能重發。run: ${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
+DEFAULT_MSG="每日報告已處理，但 reports/（含 .last_sent 防重發標記）推送失敗 ${ATTEMPTS} 次，下一班可能重發。run: ${GITHUB_SERVER_URL:-}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
+MSG="${PUSH_FAIL_MESSAGE:-$DEFAULT_MSG}"
 echo "::error title=git push 最終失敗::${MSG}"
 # 告警失敗只留 log，不能蓋掉原本的失敗結果
 # shellcheck disable=SC2086
