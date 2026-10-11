@@ -546,6 +546,90 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertEqual(os.path.join("data", "announcements"), os.path.join("data", "announcements"))
 
 
+@unittest.skipIf(yaml is None, "需要 PyYAML")
+@unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "需要 git 與 bash")
+class TestCommitStepActuallyRuns(unittest.TestCase):
+    """把 workflow 裡「提交存檔」那段 shell 原封不動拿出來，在真的 git 倉庫裡跑。
+    （2026-10 首次部署的乾跑就是死在這裡：目錄不存在時 git add 會 fatal，字串層級的契約測試看不出來。）"""
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.tmp = tempfile.mkdtemp()
+        wf = yaml.safe_load(open(os.path.join(ROOT, ".github", "workflows", "archive-announcements.yml"), encoding="utf-8"))
+        step = [s for s in wf["jobs"]["archive"]["steps"] if "push_with_retry.sh" in s.get("run", "")][0]
+        self.script = step["run"]
+        # GitHub 的 ${{ }} 運算式在本機不存在：換成固定字串，其餘環境變數原樣沿用
+        self.env_extra = {k: re.sub(r"\$\{\{[^}]*\}\}", "X", str(v)) for k, v in step["env"].items()}
+        self.remote = os.path.join(self.tmp, "remote.git")
+        self.work = os.path.join(self.tmp, "work")
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "master", self.remote)
+        self.git(self.tmp, "clone", "-q", self.remote, self.work)
+        self.git(self.work, "checkout", "-q", "-b", "master")
+        os.makedirs(os.path.join(self.work, "scripts"))
+        shutil.copy(os.path.join(ROOT, "scripts", "push_with_retry.sh"), os.path.join(self.work, "scripts"))
+        with open(os.path.join(self.work, "README"), "w") as f:
+            f.write("x")
+        self.git(self.work, "add", "-A")
+        self.git(self.work, "commit", "-q", "-m", "init")
+        self.git(self.work, "push", "-q", "origin", "master")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def git(self, cwd, *args):
+        e = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        return self.subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=e)
+
+    def run_step(self):
+        e = {**os.environ, "GITHUB_REF_NAME": "master", "PUSH_RETRY_SLEEP": "0", "PUSH_ATTEMPTS": "2", **self.env_extra}
+        return self.subprocess.run(["bash", "-e", "-c", self.script], cwd=self.work, capture_output=True, text=True, env=e)
+
+    def test_no_data_directory_at_all_is_a_clean_no_change(self):        # dry_run 或全部來源失敗時
+        self.assertFalse(os.path.exists(os.path.join(self.work, "data")))
+        r = self.run_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("無變更", r.stdout)
+
+    def test_new_archive_files_are_committed_and_pushed_then_rerun_is_a_no_change(self):
+        d = os.path.join(self.work, "data", "announcements")
+        os.makedirs(d)
+        with open(os.path.join(d, "20261010.json"), "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        r = self.run_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("push 成功", r.stdout)
+        shown = self.git(self.tmp, "--git-dir", self.remote, "show", "master:data/announcements/20261010.json")
+        self.assertEqual(shown.stdout.strip(), "{}")
+        self.assertRegex(self.git(self.work, "log", "-1", "--format=%s").stdout, r"^archive: 重大訊息 \d{4}-\d{2}-\d{2}")
+        r2 = self.run_step()
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        self.assertIn("無變更", r2.stdout)
+
+    def test_push_failure_turns_the_step_red_with_the_archive_specific_message(self):
+        d = os.path.join(self.work, "data", "announcements")
+        os.makedirs(d)
+        with open(os.path.join(d, "20261010.json"), "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        hook = os.path.join(self.remote, "hooks", "pre-receive")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        r = self.run_step()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("::error title=git push 最終失敗", r.stdout)
+        self.assertIn("API 只回傳最新一個發言日", r.stdout)
+        self.assertNotIn("每日報告", r.stdout)                   # 不能沿用日報的說明
+
+    def test_step_never_touches_reports_or_other_paths(self):
+        os.makedirs(os.path.join(self.work, "reports"))
+        with open(os.path.join(self.work, "reports", "x.txt"), "w") as f:
+            f.write("not ours")
+        r = self.run_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("無變更", r.stdout)                         # reports/ 的未追蹤檔不會被 add
+
+
 class TestPushScriptMessageOverride(unittest.TestCase):
     def test_default_message_unchanged_and_override_supported(self):
         src = open(os.path.join(ROOT, "scripts", "push_with_retry.sh"), encoding="utf-8").read()
