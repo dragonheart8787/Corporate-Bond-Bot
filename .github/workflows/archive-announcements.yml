@@ -1,0 +1,73 @@
+name: 留存重大訊息（可轉債相關，只存檔）
+
+# 目的：每天把證交所／櫃買「每日重大訊息」OpenAPI 裡「可轉債相關」公告的完整內文存進 data/announcements/，
+# 供之後離線評估內文是否含送件、申報生效、競拍日期。只留存，不解析、不接進任何報告。
+# 為什麼一定要每天抓：這兩個 API 每次只回傳最新一個發言日，錯過就補不回來。
+#
+# 不使用任何 secrets、不碰 Telegram、不觸發其他 workflow。唯一的寫入是把 data/announcements/ 提交回分支。
+on:
+  schedule:
+    # 台北 19:31（避開整點與 :30）。GitHub 排程常延遲、偶爾整個略過，所以另加一班備援（台北 23:41）：
+    # 腳本冪等（同一天重跑結果相同、沒變更就不提交），多跑一次沒有副作用。不需要備援就刪掉第二行。
+    - cron: "31 11 * * *"
+    - cron: "41 15 * * *"
+  workflow_dispatch:   # 手動補抓（同樣冪等；API 只給最新一個發言日，所以要在它被下一天取代前補）
+    inputs:
+      dry_run:
+        description: "true = 只驗證設定、印出將送出的請求，不連線、不寫檔"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# contents: write 僅為把存檔提交回分支；沒有 actions: write，沒有其他權限。
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-announcements
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # 某個來源失敗也不能讓另一個來源已成功的資料白抓：腳本把成功的部分寫完、整體以非 0 結束，
+      # 這裡用 continue-on-error 讓後面的提交照跑，最後再由「失敗閘門」把 run 變紅。
+      - name: 🗄️ 抓取並存檔（每來源一次 GET，間隔 ≥ 6 秒，不重試）
+        id: archive
+        continue-on-error: true
+        env:
+          ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          PROBE_REPO: ${{ github.repository }}
+        run: python3 scripts/archive_announcements.py
+
+      - name: 📝 提交存檔（pull --rebase、重試；最終失敗會讓 run 變紅）
+        if: ${{ !cancelled() && steps.archive.outcome != 'skipped' }}
+        env:
+          # 不走預設的 Telegram 告警：本 workflow 不碰 Telegram，最終失敗只靠 ::error:: 與紅色 run
+          PUSH_ALERT_CMD: "echo"
+          PUSH_FAIL_MESSAGE: "重大訊息已抓取但 data/announcements 推送失敗。API 只回傳最新一個發言日，今天的資料可能因此遺失，請盡快手動重跑。run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/announcements
+          if git diff --staged --quiet; then
+            echo "無變更，略過 commit"
+            exit 0
+          fi
+          git commit -m "archive: 重大訊息 $(TZ=Asia/Taipei date +%F)"
+          bash scripts/push_with_retry.sh
+
+      - name: 🚦 失敗閘門（抓取有任何失敗就讓 run 變紅）
+        if: ${{ always() && steps.archive.outcome == 'failure' }}
+        run: |
+          echo "::error title=重大訊息留存有失敗::上方 [抓取並存檔] 步驟有來源失敗或結構異常，詳見其 ::error:: 訊息。成功的來源已提交。"
+          exit 1

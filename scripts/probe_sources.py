@@ -127,9 +127,9 @@ def default_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_NoRedirect())
 
 
-def user_agent(repo: str) -> str:
+def user_agent(repo: str, tool: str = "probe", purpose: str = "read-only schema check") -> str:
     base = f"https://github.com/{repo}" if repo else "https://github.com/dragonheart8787/Corporate-Bond-Bot"
-    return f"Corporate-Bond-Bot-probe/1.0 (+{base}; read-only schema check, 1 request per source)"
+    return f"Corporate-Bond-Bot-{tool}/1.0 (+{base}; {purpose}, 1 request per source)"
 
 
 def _hint(status: int) -> str:
