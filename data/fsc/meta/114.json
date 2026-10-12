@@ -1,0 +1,57 @@
+{
+ "columns": [
+  "證券代號",
+  "公司型態",
+  "結案類型",
+  "公司名稱",
+  "承銷商",
+  "案件類別",
+  "金額",
+  "幣別",
+  "發行價格",
+  "收文日期",
+  "自動補正日期",
+  "停止生效日期",
+  "解除生效日期",
+  "生效日期",
+  "廢止/撤銷日期",
+  "自行撤回日期",
+  "退件日期",
+  "案件性質"
+ ],
+ "file_version": "",
+ "filename_decoded": "1141231626申報案件彙總表.xlsx",
+ "filename_original": "1141231626%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A8.xlsx",
+ "filename_safe": "1141231626申報案件彙總表.xlsx",
+ "first_seen": "2026-10-12",
+ "header_row": 3,
+ "history": [
+  {
+   "filename": "1141231626申報案件彙總表.xlsx",
+   "first_seen": "2026-10-12",
+   "sha256": "3865937332ebe7a72bb5dde87b96321ab1c7fcdb87e3d4bd2cd467ba0218dfd4",
+   "sha8": "38659373",
+   "size": 80549
+  }
+ ],
+ "link_text": "EXCEL",
+ "page_update_text": "2026-10-08",
+ "reference_date": "2026-10-08",
+ "row_counts": {
+  "blank_rows": 2,
+  "data_rows": 767,
+  "sheet_rows": 772,
+  "trailer_rows": 0
+ },
+ "sha256": "3865937332ebe7a72bb5dde87b96321ab1c7fcdb87e3d4bd2cd467ba0218dfd4",
+ "sheet_name": "IMP0080A_Upload",
+ "size": 80549,
+ "source_date_filename": "2025-12-31",
+ "source_date_page": "2026-10-08",
+ "source_page": "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52",
+ "source_url": "https://www.fsc.gov.tw/userfiles/file/1141231626%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A8.xlsx",
+ "trailer_rows": [],
+ "version": 1,
+ "year": "114",
+ "year_label": "114年度申報案件"
+}
