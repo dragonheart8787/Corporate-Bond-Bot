@@ -41,7 +41,8 @@
   "blank_rows": 2,
   "data_rows": 767,
   "sheet_rows": 772,
-  "trailer_rows": 0
+  "trailer_rows": 0,
+  "trailing_blank_rows": 2
  },
  "sha256": "3865937332ebe7a72bb5dde87b96321ab1c7fcdb87e3d4bd2cd467ba0218dfd4",
  "sheet_name": "IMP0080A_Upload",
