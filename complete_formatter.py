@@ -12,7 +12,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
 
-from fsc_progress import build_progress_block
+from fsc_progress import AnnouncementLookup, build_progress_block
 from telegram_date_utils import (
     COMPANY_RE,
     PUBLISH_TIME_RE,
@@ -36,6 +36,7 @@ def safe_print(msg: str):
 
 class CompleteFormatter:
     def __init__(self):
+        self._fsc_lookup = None   # 每份報告共用一個 AnnouncementLookup（見 format_with_convertible_bond_priority）
         # 轉換公司債相關關鍵字
         # 轉換公司債判定：加權與語境
         self.cb_strong_kw = ['可轉債', '轉換公司債', '可轉換公司債', '轉債']
@@ -238,6 +239,13 @@ class CompleteFormatter:
                 result.append(f"  ❗ 負向：{'; '.join(analysis['Negative'])}")
             if analysis['Neutral']:
                 result.append(f"  ℹ 中性：{'; '.join(analysis['Neutral'])}")
+
+        # 申報表：用公告的證券代號查 data/fsc（純本地讀檔、不比對標題與公司名稱）。放在「公司情況研判」之後，不改動研判文字。
+        if category == '轉換公司債':
+            if self._fsc_lookup is None:
+                self._fsc_lookup = AnnouncementLookup()
+            result.append("")
+            result.extend(self._fsc_lookup.lines_for(company_info.get('code')))
         
         result.append("=" * 80)
         result.append("")
@@ -246,6 +254,7 @@ class CompleteFormatter:
     
     def format_with_convertible_bond_priority(self, rows: List[Dict]) -> str:
         """按轉換公司債優先順序格式化所有公告"""
+        self._fsc_lookup = None   # 每份報告重新讀一次 data/fsc，同一份報告內所有公告共用同一個評估結果
         # 分離轉換公司債和其他公告
         convertible_bond_announcements = []
         other_announcements = []
