@@ -93,6 +93,9 @@ class DataDir:
         self.write(f"parsed/{year}.json", {"sha256": parsed_sha or sha, "rows": rows})
         return sha
 
+    def check(self, years, raw=None):
+        self.write("_last_check.json", {"version": 1, "years": years}, raw=raw)
+
     def diff(self, year, old8, new_sha, added=(), vanished=(), changed=(), name=None):
         self.write(name or f"diffs/{year}_{old8}_{new_sha[:8]}.json",
                    {"year": year, "old_sha256": old8 * 8, "new_sha256": new_sha, "added": list(added), "vanished": list(vanished), "changed": list(changed)})
@@ -109,9 +112,13 @@ class Base(unittest.TestCase):
     def text(self, now=NOW):
         return self.report(now).text
 
-    def good(self, rows115, rows114=(), **kw):
+    def good(self, rows115, rows114=(), check="today", **kw):
         self.d.year("115", list(rows115), **kw)
         self.d.year("114", list(rows114), **kw)
+        if check == "today":                      # 預設：兩個年度今天都檢查成功
+            self.d.check({"115": "2026-10-12", "114": "2026-10-12"})
+        elif check:
+            self.d.check(check)
 
 
 # ─────────────────────────────────────────
@@ -406,10 +413,30 @@ class TestDiffSection(Base):
         for noise in ("9999", "8888", "7777"):
             self.assertNotIn(noise, sec)
 
-    def test_missing_diff_file_means_first_version(self):
+    def test_no_previous_version_means_no_diff_section_at_all(self):
+        sha = self.make(days_ago(1))
+        meta = json.load(open(os.path.join(self.d.dir, "meta", "115.json"), encoding="utf-8"))
+        meta["history"] = [meta["history"][-1]]                                  # 只有一個版本
+        self.d.write("meta/115.json", meta)
+        os.remove(os.path.join(self.d.dir, "diffs", os.listdir(os.path.join(self.d.dir, "diffs"))[0]))
+        t = self.text()
+        self.assertNotIn("較上次資料版本的變動", t)
+        self.assertNotIn("首次留存", t)
+        self.assertNotIn("沒有可比對", t)
+        self.assertNotIn("115", self.report().counts["diff"])
+
+    def test_previous_version_exists_but_diff_file_is_missing_is_reported_not_hidden(self):
         self.make(days_ago(1))
         os.remove(os.path.join(self.d.dir, "diffs", os.listdir(os.path.join(self.d.dir, "diffs"))[0]))
-        self.assertIn("本版本沒有可比對的前一版", self.text())
+        rep = self.report()
+        self.assertIn("此版本有前一版，但找不到對應的 diffs 檔", rep.text)
+        self.assertEqual(rep.counts["diff"]["115"]["bad"], 1)
+
+    def test_year_without_previous_version_shows_no_diff_section_even_when_the_other_year_has_one(self):
+        self.make(days_ago(1), added=[f"1001|{self.cat}|1151005|900000000#1"])
+        t = self.text()
+        self.assertEqual(t.count("較上次資料版本的變動"), 1)
+        self.assertIn("115年檔", t.split("較上次資料版本的變動")[1][:30])
 
     def test_corrupt_or_malformed_diff_is_reported_not_fatal(self):
         sha = self.make(days_ago(1))
@@ -508,14 +535,14 @@ class TestFailClosed(Base):
         self.assertNotIn("2001", rep.text)
         self.assertIn("只列出仍可讀取的版本內容", rep.text)
 
-    def test_stale_threshold_is_more_than_7_days_on_the_current_year_file(self):
+    def test_without_a_check_record_the_old_7_day_rule_applies_to_the_current_year_file(self):
         for age, state in ((0, "正常"), (7, "正常"), (8, "過舊"), (30, "過舊")):
             self.d.year("115", [prow("1001")], first_seen=days_ago(age))
             self.d.year("114", [])
             rep = self.report()
             self.assertEqual(rep.state, state, age)
             if state == "過舊":
-                self.assert_flagged(rep.text, "過舊", f"首次看到於 {age} 天前")
+                self.assert_flagged(rep.text, "過舊", f"尚無檢查紀錄，暫以此版本首次看到日判斷：{age} 天前")
                 self.assertIn("1001", rep.text)                        # 仍列出，但已加上明確警示，不假裝最新
                 self.assertIn("不要當成最新狀態", rep.text)
             else:
@@ -598,22 +625,248 @@ class TestFailClosed(Base):
 
 
 # ─────────────────────────────────────────
+# 依「最後成功檢查日」判斷過舊
+# ─────────────────────────────────────────
+class TestFreshnessByLastCheck(Base):
+    STALE = "申報進度資料過舊(最後成功檢查 {d}),抓取可能失敗"
+
+    def setup_years(self, first_seen="2026-10-12", check=None, **kw):
+        self.d.year("115", [prow("1001")], first_seen=first_seen)
+        self.d.year("114", [prow("2001", receipt="2025-12-01")], first_seen=kw.get("first_seen114", first_seen))
+        if check is not None:
+            self.d.check(check)
+
+    def test_fresh_check_is_normal_and_shown_in_the_version_line(self):
+        self.setup_years(check={"115": "2026-10-12", "114": "2026-10-12"})
+        rep = self.report()
+        self.assertEqual((rep.state, rep.label, rep.notes), ("正常", "正常", []))
+        self.assertIn("最近成功檢查 2026-10-12", rep.text)
+        self.assertNotIn("申報進度資料缺失/過舊", rep.text)
+
+    def test_three_day_boundary_day_3_is_ok_day_4_is_stale(self):
+        for gap, state in ((0, "正常"), (1, "正常"), (3, "正常"), (4, "過舊"), (20, "過舊")):
+            self.setup_years(check={"115": days_ago(gap), "114": "2026-10-12"})
+            rep = self.report()
+            self.assertEqual(rep.state, state, gap)
+            if state == "過舊":
+                self.assertIn(self.STALE.format(d=days_ago(gap)), rep.text)
+                self.assertIn("以下只列出仍可讀取的版本內容", rep.text)
+                self.assertIn("1001", rep.text)                                   # 仍列出，但已有明確警示
+            else:
+                self.assertNotIn("過舊", rep.text)
+
+    def test_each_year_is_judged_by_its_own_check_date_including_the_old_year_file(self):
+        self.setup_years(first_seen="2026-10-12", check={"115": "2026-10-12", "114": days_ago(4)})
+        rep = self.report()
+        self.assertEqual(rep.state, "過舊")
+        self.assertEqual(rep.reasons, ["114年檔：" + self.STALE.format(d=days_ago(4))])
+        self.assertIn("1001", rep.text)
+        self.assertIn("2001", rep.text)
+
+    def test_source_not_updated_for_days_but_check_ok_is_not_stale(self):
+        self.setup_years(first_seen=days_ago(40), check={"115": "2026-10-12", "114": "2026-10-12"})
+        rep = self.report()
+        self.assertEqual(rep.state, "正常")
+        self.assertEqual(rep.label, "來源 40 天未更新")
+        self.assertEqual(len(rep.versions), 2)                                  # 註記行不算版本行
+        self.assertIn("來源 40 天未更新(最近檢查 2026-10-12,正常)", rep.text)
+        self.assertNotIn("申報進度資料缺失/過舊", rep.text)
+        self.assertTrue(fp.status_line(NOW, self.d.dir).startswith("來源 40 天未更新｜"))
+
+    def test_source_age_note_starts_at_two_days(self):
+        for age, shown in ((0, False), (1, False), (2, True), (3, True)):
+            self.setup_years(first_seen=days_ago(age), check={"115": "2026-10-12", "114": "2026-10-12"})
+            rep = self.report()
+            self.assertEqual("天未更新(最近檢查" in rep.text, shown, age)
+
+    def test_old_year_file_note_does_not_change_the_overall_label(self):
+        self.d.year("115", [prow("1001")], first_seen="2026-10-12")
+        self.d.year("114", [], first_seen=days_ago(200))
+        self.d.check({"115": "2026-10-12", "114": "2026-10-12"})
+        rep = self.report()
+        self.assertEqual(rep.label, "正常")
+        self.assertIn("114年檔 v2", rep.text)
+        self.assertIn("來源 200 天未更新(最近檢查 2026-10-12,正常)", rep.text)
+
+    def test_taipei_midnight_changes_the_gap(self):
+        self.setup_years(check={"115": "2026-10-09", "114": "2026-10-09"})
+        before = datetime(2026, 10, 12, 15, 59, tzinfo=timezone.utc)      # 台北 10-12 23:59 → 差 3 天
+        after = datetime(2026, 10, 12, 16, 0, tzinfo=timezone.utc)        # 台北 10-13 00:00 → 差 4 天
+        self.assertEqual(self.report(before).state, "正常")
+        self.assertEqual(self.report(after).state, "過舊")
+        self.assertIn(self.STALE.format(d="2026-10-09"), self.text(after))
+
+    def test_process_timezone_does_not_matter(self):
+        self.setup_years(check={"115": "2026-10-09", "114": "2026-10-09"})
+        now = datetime(2026, 10, 12, 16, 30, tzinfo=timezone.utc)
+        old = os.environ.get("TZ")
+        try:
+            states = set()
+            for tz in ("UTC", "America/Los_Angeles", "Pacific/Kiritimati"):
+                os.environ["TZ"] = tz
+                time.tzset()
+                states.add(self.report(now).state)
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.assertEqual(states, {"過舊"})
+
+    def test_missing_record_falls_back_to_old_rule_and_says_so(self):
+        for age, state in ((7, "正常"), (8, "過舊")):
+            self.setup_years(first_seen=days_ago(age))
+            rep = self.report()
+            self.assertEqual(rep.state, state, age)
+            self.assertIn("尚無檢查紀錄", rep.text)
+            self.assertIn("尚無檢查紀錄", rep.label)
+            self.assertIn("沿用舊規則", rep.label)
+            self.assertNotEqual(rep.label, "正常")                            # 不得靜默視為正常
+        self.assertIn("尚無檢查紀錄，暫以此版本首次看到日判斷：8 天前", self.text())
+
+    def test_corrupt_record_is_reported_as_abnormal_and_old_rule_applies(self):
+        bads = ["{broken", "[]", json.dumps({"years": {}}), json.dumps({"version": 2, "years": {}}), json.dumps({"version": 1, "years": []}),
+                json.dumps({"version": 1, "years": {"115": "2026-13-40"}}), json.dumps({"version": 1, "years": {"x": "2026-10-12"}}),
+                json.dumps({"version": 1, "years": {"115": "2026-10-12"}, "extra": 1}), json.dumps({"version": 1, "years": {"115": 5}})]
+        for bad in bads:
+            self.setup_years(first_seen=days_ago(1))
+            self.d.check(None, raw=bad)
+            rep = self.report()
+            self.assertEqual(rep.state, "正常", bad)
+            self.assertIn("檢查紀錄異常", rep.text, bad)
+            self.assertIn("檢查紀錄異常", rep.label, bad)
+            self.assertNotIn("尚無檢查紀錄", rep.text)
+            self.setup_years(first_seen=days_ago(9))
+            self.assertEqual(self.report().state, "過舊", bad)
+
+    def test_year_missing_from_the_record_uses_fallback_for_that_year_only(self):
+        self.setup_years(check={"115": "2026-10-12"})
+        rep = self.report()
+        self.assertIn("114年檔：尚無檢查紀錄", rep.text)
+        self.assertNotIn("115年檔：尚無檢查紀錄", rep.text)
+        self.assertEqual(rep.state, "正常")
+
+    def test_a_check_date_in_the_future_is_abnormal(self):
+        self.setup_years(check={"115": days_ago(-1), "114": "2026-10-12"})
+        rep = self.report()
+        self.assertIn("檢查紀錄異常", rep.text)
+        self.assertIn("晚於今日", rep.text)
+
+    def test_with_a_good_record_the_old_first_seen_rule_is_not_used(self):
+        self.setup_years(first_seen=days_ago(60), check={"115": "2026-10-12", "114": "2026-10-12"})
+        self.assertEqual(self.report().state, "正常")
+
+    def test_missing_data_still_beats_everything(self):
+        self.setup_years(check={"115": "2026-10-12", "114": "2026-10-12"})
+        os.remove(os.path.join(self.d.dir, "parsed", "115.json"))
+        rep = self.report()
+        self.assertEqual((rep.state, rep.label), ("缺失", "缺失"))
+
+
+# ─────────────────────────────────────────
+# 完全相同的重複列、範圍行
+# ─────────────────────────────────────────
+class TestIdenticalRows(Base):
+    NOTE = "（來源表中完全相同的列 ×{n}）"
+
+    def test_identical_rows_are_all_listed_each_with_the_note(self):
+        rows = [prow("1001", seq=i + 1, rownum=10 + i) for i in range(3)] + [prow("1002")]
+        self.good(rows)
+        rep = self.report()
+        rev = rep.text.split("⏳ 審理中")[1].split("✅ 近期已生效")[0]
+        self.assertEqual(rev.count("  • 1001"), 3)                                  # 不合併
+        self.assertEqual(rev.count(self.NOTE.format(n=3)), 3)
+        lines = rev.splitlines()
+        for i, ln in enumerate(lines):
+            if ln.startswith("  • 1001"):
+                self.assertTrue(lines[i + 1].endswith(self.NOTE.format(n=3)))      # 註記在該筆的最後一行
+        one = [i for i, ln in enumerate(lines) if ln.startswith("  • 1002")][0]
+        self.assertNotIn("完全相同", lines[one] + lines[one + 1])
+        self.assertEqual(rep.counts["reviewing"], 4)
+        self.assertEqual(rep.counts["identical_rows"], 3)
+
+    def test_any_differing_field_means_no_note(self):
+        a, b = prow("1001", seq=1), prow("1001", seq=2, rownum=11)
+        b["fields"]["承銷商"] = "另一家券商"
+        self.good([a, b, prow("1001", amount="700000000", seq=3, rownum=12)])
+        self.assertNotIn("完全相同", self.text())
+
+    def test_note_counts_are_per_year_file(self):
+        self.good([prow("1001")], [prow("1001")])
+        self.assertNotIn("完全相同", self.text())
+        self.good([prow("1001", seq=1), prow("1001", seq=2, rownum=11)], [prow("1001")])
+        self.assertEqual(self.text().count(self.NOTE.format(n=2)), 2)
+
+    def test_note_also_in_effective_and_terminated_sections(self):
+        rows = [prow("1001", closing="生效", eff=days_ago(1), seq=1), prow("1001", closing="生效", eff=days_ago(1), seq=2, rownum=11),
+                prow("1002", closing="退件", reject=days_ago(1), seq=1), prow("1002", closing="退件", reject=days_ago(1), seq=2, rownum=11)]
+        self.good(rows)
+        t = self.text()
+        eff = t.split("✅ 近期已生效")[1].split("🛑 近期終止")[0]
+        term = t.split("🛑 近期終止")[1]
+        self.assertEqual(eff.count(self.NOTE.format(n=2)), 2)
+        self.assertEqual(term.count(self.NOTE.format(n=2)), 2)
+
+    def test_diff_block_annotates_identical_rows_and_counts_match_what_is_listed(self):
+        cat = "轉換公司債(無擔保)"
+        rows = [prow("1001", closing="生效", eff=days_ago(1), seq=1, receipt="2026-10-01"), prow("1001", closing="生效", eff=days_ago(1), seq=2, rownum=11, receipt="2026-10-01"),
+                prow("1002", closing="生效", eff=days_ago(1), receipt="2026-10-02"), prow("1003", closing="生效", eff=days_ago(1), receipt="2026-10-03", seq=1)]
+        sha = self.d.year("115", rows, first_seen=days_ago(1), history=[{"sha8": "oldoldol"}, {"sha8": "11511511"}])
+        self.d.year("114", [])
+        self.d.check({"115": "2026-10-12", "114": "2026-10-12"})
+        self.d.diff("115", "oldoldol", sha,
+                    added=[f"1001|{cat}|1151001|500000000#1", f"1001|{cat}|1151001|500000000#2"],
+                    vanished=[f"9001|{cat}|1150901|1#1"],
+                    changed=[{"id": f"1002|{cat}|1151002|500000000#1", "field": "結案類型", "old": "", "new": "生效"},
+                             {"id": f"1001|{cat}|1151001|500000000#1", "field": "結案類型", "old": "", "new": "生效"},
+                             {"id": f"1001|{cat}|1151001|500000000#2", "field": "結案類型", "old": "", "new": "生效"}])
+        rep = self.report()
+        sec = rep.text.split("🔄 較上次資料版本的變動")[1].split("（以上為申報進度")[0]
+        d = rep.counts["diff"]["115"]
+        items = [ln for ln in sec.splitlines() if ln.startswith("  • ")]
+        self.assertEqual((d["added"], d["vanished"], d["changed"]), (2, 1, 3))
+        self.assertEqual(len(items), d["added"] + d["vanished"] + d["changed"])           # 計數 = 顯示的行數
+        self.assertIn("新增 2、消失 1、欄位變動 3（其中 4 筆屬於來源表中完全相同的重複列，各自獨立計入）", sec)
+        dup_items = [ln for ln in items if self.NOTE.format(n=2) in ln]
+        self.assertEqual(len(dup_items), 4)
+        self.assertEqual(sum(1 for ln in items if ln.startswith("  • 消失") and "完全相同" in ln), 0)
+        self.assertEqual(sum(1 for ln in items if "1002" in ln and "完全相同" in ln), 0)
+
+
+class TestScopeLine(Base):
+    def test_scope_line_states_the_cumulative_years(self):
+        self.good([prow("1001")], [prow("2001", closing="生效", eff=days_ago(1))])
+        self.assertIn("📊 範圍內 2 列（115＋114年累計；", self.text())
+
+    def test_scope_line_when_only_one_year_is_readable(self):
+        self.good([prow("1001")], [])
+        os.remove(os.path.join(self.d.dir, "parsed", "114.json"))
+        t = self.text()
+        self.assertIn("📊 範圍內 1 列（115年累計；", t)
+        self.assertNotIn("115＋114", t)
+
+# ─────────────────────────────────────────
 # 版本行、/status
 # ─────────────────────────────────────────
 class TestVersionAndStatus(Base):
     def test_version_line_shows_the_version_actually_used(self):
         self.d.year("115", [prow()], first_seen="2026-10-10", version="3", page_update_text="2026-10-09", filename_decoded="1151009申報v3.xlsx")
         self.d.year("114", [])
+        self.d.check({"115": "2026-10-12", "114": "2026-10-12"})
         t = self.text()
-        self.assertIn("115年檔 v3｜來源更新 2026-10-09｜此版本首次看到 2026-10-10（2 天前）｜sha 11511511｜1151009申報v3.xlsx", t)
+        self.assertIn("115年檔 v3｜來源更新 2026-10-09｜此版本首次看到 2026-10-10（2 天前）｜最近成功檢查 2026-10-12｜sha 11511511｜1151009申報v3.xlsx", t)
         self.assertIn("本報告實際使用", t)
 
-    def test_status_line_three_states(self):
+    def test_status_line_four_states(self):
         self.good([prow()])
         self.assertTrue(fp.status_line(NOW, self.d.dir).startswith("正常｜115年檔 v2"))
-        self.d.year("115", [prow()], first_seen=days_ago(9))
+        self.good([prow()], first_seen=days_ago(5))                                  # 檢查正常、來源 5 天沒有新版本
         s = fp.status_line(NOW, self.d.dir)
-        self.assertTrue(s.startswith("過舊｜") and "9 天前" in s)
+        self.assertTrue(s.startswith("來源 5 天未更新｜115年檔 v2"), s)
+        self.d.check({"115": days_ago(4), "114": "2026-10-12"})                       # 檢查日太舊
+        s = fp.status_line(NOW, self.d.dir)
+        self.assertTrue(s.startswith("過舊｜") and "最後成功檢查 2026-10-08" in s, s)
         os.remove(os.path.join(self.d.dir, "meta", "115.json"))
         s = fp.status_line(NOW, self.d.dir)
         self.assertTrue(s.startswith("缺失｜") and "meta/115.json" in s)

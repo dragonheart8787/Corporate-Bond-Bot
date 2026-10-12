@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 import bot_relay as relay
 from fsc_progress import append_progress_block, status_line as fsc_status_line
+from message_split import split_message
 from telegram_date_utils import report_yyyymmdd
 
 TW = timezone(timedelta(hours=8))
@@ -243,7 +244,7 @@ def filter_cb_only(full_report: str) -> str:
 # ─────────────────────────────────────────
 def send_message(token: str, chat_id: str, text: str) -> bool:
     """送出訊息（自動分段、重試）。回傳是否全部送出；失敗一律留下遮罩後的 log，不再靜默吞掉。"""
-    chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
+    chunks = split_message(text)     # 只在換行處切，案件的兩行不拆開（見 message_split.py）
     total = len(chunks)
     who = relay.mask_chat_id(chat_id)
     all_ok = True

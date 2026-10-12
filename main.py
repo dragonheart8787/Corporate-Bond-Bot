@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from bot_relay import redact   # 例外訊息可能含帶 token 的請求網址，輸出前一律遮罩
 from fsc_progress import append_progress_block
+from message_split import split_message
 from telegram_date_utils import report_yyyymmdd
 
 # 與 quick_format / exporter 一致，避免「固定 UTC+8」與 IANA 時區在邊界日期不一致
@@ -119,7 +120,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     import requests
     import time
 
-    chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
+    chunks = split_message(text)     # 只在換行處切，案件的兩行不拆開（見 message_split.py）
     total = len(chunks)
     failed = []
 

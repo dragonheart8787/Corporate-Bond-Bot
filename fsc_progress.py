@@ -53,7 +53,10 @@ DIFF_FIELDS = ("結案類型", "自動補正日期", "停止生效日期", "解�
 
 RECENT_DAYS = 14        # 近期已生效／近期終止：今日（台北）往前 14 天（含）
 DIFF_DAYS = 3           # 較上次版本的變動：最新版本首次看到日在 3 天（含）內才顯示
-STALE_DAYS = 7          # 目前年度檔的此版本首次看到日距今超過 7 天 → 過舊
+STALE_DAYS = 7          # 「沒有檢查紀錄」時的備用規則：目前年度檔的此版本首次看到日距今超過 7 天 → 過舊
+CHECK_STALE_DAYS = 3    # 主要規則：某年度「最後成功檢查日」距今（台北日）超過 3 天 → 過舊（抓取可能失敗）
+SOURCE_NOTE_MIN_DAYS = 2    # 檢查正常但此版本已 N（≥2）天沒有新版本 → 只註明「來源 N 天未更新」，不算過舊
+LAST_CHECK_NAME = "_last_check.json"   # 由 scripts/archive_fsc.py 寫入：{"version":1,"years":{"115":"YYYY-MM-DD",…}}
 MAX_LIST = 30
 TITLE = "📑 金管會申報進度（轉換公司債）"
 FOOTER = "（以上為申報進度；資料來源：金管會證期局「申報案件辦理情形彙總表」，僅供參考，請以原表為準）"
@@ -223,6 +226,7 @@ class Case:
     category: str
     receipt: Optional[date]
     key: str
+    same_n: int = 1               # 同一年度檔內「18 欄完全相同」的列數（含自己）
 
     def get(self, col: str) -> str:
         return norm(self.fields.get(col))
@@ -270,6 +274,11 @@ def classify_row(year: str, row: Any, today: date) -> Optional[Case]:
     return c
 
 
+def dup_note(c: Optional[Case]) -> str:
+    """同案件鍵且各欄位完全相同的重複列：不合併，每一列都各自顯示，並在該列尾端註明有幾列完全相同。"""
+    return f"（來源表中完全相同的列 ×{c.same_n}）" if c is not None and c.same_n >= 2 else ""
+
+
 def row_label(c: Case) -> str:
     name = c.get("公司名稱") or DASH
     return f"{c.code} {name}｜{short_category(c.category)}"
@@ -293,18 +302,18 @@ def reviewing_lines(c: Case) -> List[str]:
         parts.append(f"解除生效日期 {fmt_date_cell(f.get('解除生效日期'))}")
     parts.append(f"生效日期（預定）{fmt_date_cell(f.get('生效日期'))}" if eff else f"生效日期（預定）{DASH}")
     parts.append(c.get("案件性質") or DASH)
-    return [first, "      " + "｜".join(parts)]
+    return [first, "      " + "｜".join(parts) + dup_note(c)]
 
 
 def effective_line(c: Case) -> str:
     return (f"  • {row_label(c)}｜{fmt_amount(c.fields)}｜收文日期（送件）{fmt_date_cell(c.fields.get('收文日期'))}"
-            f"｜生效日期 {fmt_date_cell(c.fields.get('生效日期'))}")
+            f"｜生效日期 {fmt_date_cell(c.fields.get('生效日期'))}{dup_note(c)}")
 
 
 def terminated_line(c: Case) -> str:
     col = TERMINATION_COLUMNS[c.closing]
     return (f"  • {row_label(c)}｜{c.closing}｜{col} {fmt_date_cell(c.fields.get(col))}"
-            f"｜收文日期（送件）{fmt_date_cell(c.fields.get('收文日期'))}")
+            f"｜收文日期（送件）{fmt_date_cell(c.fields.get('收文日期'))}{dup_note(c)}")
 
 
 def _recv_key(c: Case) -> Tuple[int, int, str, int]:
@@ -355,11 +364,15 @@ def _diff_value(col: str, v: Any) -> str:
 
 def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[List[str], Dict[str, int]]:
     """CB 三類限定的新增／消失／欄位變動。回傳 (行, 計數)。"""
-    counts = {"added": 0, "vanished": 0, "changed": 0, "bad": 0}
+    counts = {"added": 0, "vanished": 0, "changed": 0, "bad": 0, "dup_listed": 0}
     path = find_diff_file(data_dir, yd)
     head = f"🔄 較上次資料版本的變動（{yd.year}年檔，此版本於 {yd.first_seen} 首次看到）"
     if path is None:
-        return [head, "  本版本沒有可比對的前一版（首次留存）"], counts
+        hist = yd.meta.get("history")
+        if isinstance(hist, list) and len(hist) >= 2:       # 明明有前一版卻找不到比對檔：要說出來，不能當成沒有變動
+            counts["bad"] = 1
+            return [head, "  ⚠ 資料異常：此版本有前一版，但找不到對應的 diffs 檔"], counts
+        return [], counts                                    # 首次留存：沒有「較上次的變動」可言，整段不顯示
     obj, err = _read_json(path)
     if err or not isinstance(obj, dict) or not all(isinstance(obj.get(k), list) for k in ("added", "vanished", "changed")):
         counts["bad"] = 1
@@ -381,7 +394,8 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
         counts["added"] += 1
         c = lookup.get(f"{yd.year}|{p[0]}|{norm(p[1])}|{p[2]}|{p[4]}")
         who = f"{c.code} {c.get('公司名稱') or DASH}｜{short_category(c.category)}｜{fmt_amount(c.fields)}" if c else f"{p[0]}｜{short_category(p[1])}"
-        items.append([f"  • 新增：{who}｜收文日期（送件）{fmt_date_cell(p[2])}"])
+        counts["dup_listed"] += 1 if c is not None and c.same_n >= 2 else 0
+        items.append([f"  • 新增：{who}｜收文日期（送件）{fmt_date_cell(p[2])}{dup_note(c)}"])
     for i in obj["vanished"]:
         p = _id_parts(i)
         if p is None:
@@ -405,9 +419,11 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
         counts["changed"] += 1
         c = lookup.get(f"{yd.year}|{p[0]}|{norm(p[1])}|{p[2]}|{p[4]}")
         name = c.get("公司名稱") if c and c.get("公司名稱") else DASH
+        counts["dup_listed"] += 1 if c is not None and c.same_n >= 2 else 0
         items.append([f"  • 變動：{p[0]} {name}｜{short_category(p[1])}｜收文日期（送件）{fmt_date_cell(p[2])}｜"
-                      f"{col}：{_diff_value(col, ch.get('old'))} → {_diff_value(col, ch.get('new'))}"])
+                      f"{col}：{_diff_value(col, ch.get('old'))} → {_diff_value(col, ch.get('new'))}{dup_note(c)}"])
     lines = [head, f"  新增 {counts['added']}、消失 {counts['vanished']}、欄位變動 {counts['changed']}"
+                   + (f"（其中 {counts['dup_listed']} 筆屬於來源表中完全相同的重複列，各自獨立計入）" if counts["dup_listed"] else "")
                    + (f"（另有 {counts['bad']} 筆資料異常）" if counts["bad"] else "")]
     lines.extend(_cap_items(items))
     return lines, counts
@@ -419,19 +435,63 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
 @dataclass
 class ProgressReport:
     text: str = ""
-    state: str = "正常"                 # 正常 | 過舊 | 缺失
+    state: str = "正常"                 # 正常 | 過舊 | 缺失（區塊警示用）
+    label: str = "正常"                 # /status 用：正常 | 來源 N 天未更新 | 過舊 | 缺失（可能帶「尚無檢查紀錄／檢查紀錄異常」說明）
     reasons: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
     counts: Dict[str, Any] = field(default_factory=dict)
     versions: List[str] = field(default_factory=list)
 
 
-def _version_line(yd: YearData, today: date) -> str:
+@dataclass
+class CheckRecord:
+    status: str = "missing"             # ok | missing | corrupt
+    years: Dict[str, date] = field(default_factory=dict)
+    reason: str = ""
+
+
+def load_last_check(data_dir: str) -> CheckRecord:
+    """讀 data/fsc/_last_check.json（每個年度的最後成功檢查日）。缺失與損毀分開回報，呼叫端不得把它們當成正常。"""
+    obj, err = _read_json(os.path.join(data_dir, LAST_CHECK_NAME))
+    if err == "檔案不存在":
+        return CheckRecord("missing", reason=err)
+    if err:
+        return CheckRecord("corrupt", reason=err)
+    ok = isinstance(obj, dict) and obj.get("version") == 1 and isinstance(obj.get("years"), dict) and set(obj) == {"version", "years"}
+    years: Dict[str, date] = {}
+    if ok:
+        for k, v in obj["years"].items():
+            d = parse_iso(v) if isinstance(v, str) else None
+            if not (isinstance(k, str) and re.fullmatch(r"\d{3}", k) and d):
+                ok = False
+                break
+            years[k] = d
+    if not ok:
+        return CheckRecord("corrupt", reason="結構不符（版本、欄位或日期格式異常）")
+    return CheckRecord("ok", years)
+
+
+def year_check(rec: CheckRecord, year: str, today: date) -> Tuple[str, Optional[date], str]:
+    """回傳 (狀態, 最後成功檢查日, 說明)；狀態 ok | missing | corrupt。"""
+    if rec.status == "corrupt":
+        return "corrupt", None, f"檢查紀錄異常（{rec.reason}）"
+    if rec.status == "missing":
+        return "missing", None, "尚無檢查紀錄"
+    d = rec.years.get(year)
+    if d is None:
+        return "missing", None, "尚無檢查紀錄"
+    if d > today:
+        return "corrupt", None, f"檢查紀錄異常（最後成功檢查日 {d} 晚於今日 {today}）"
+    return "ok", d, ""
+
+
+def _version_line(yd: YearData, today: date, check_txt: str) -> str:
     m = yd.meta
     age = (today - yd.first_seen).days if yd.first_seen else 0
     age_txt = "今日" if age == 0 else f"{age} 天前"
     ver = norm(m.get("file_version"))
     return (f"  {yd.year}年檔 {'v' + ver if ver else '無版本號'}｜來源更新 {norm(m.get('page_update_text')) or DASH}"
-            f"｜此版本首次看到 {yd.first_seen}（{age_txt}）｜sha {str(m.get('sha256'))[:8]}｜{norm(m.get('filename_decoded')) or DASH}")
+            f"｜此版本首次看到 {yd.first_seen}（{age_txt}）｜{check_txt}｜sha {str(m.get('sha256'))[:8]}｜{norm(m.get('filename_decoded')) or DASH}")
 
 
 def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None) -> ProgressReport:
@@ -439,8 +499,12 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
     today = taipei_today(now)
     rep = ProgressReport()
     years = [load_year(data_dir, y) for y in FSC_YEARS]
+    rec = load_last_check(data_dir)
     reasons_missing: List[str] = []
     reasons_stale: List[str] = []
+    fallback_labels: List[str] = []
+    version_lines: List[str] = []
+    primary_source_age: Optional[int] = None
     for yd in years:
         if not yd.ok:
             reasons_missing.append(f"{yd.year}年檔：{yd.error}")
@@ -449,11 +513,39 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
             reasons_missing.append(f"{yd.year}年檔：此版本首次看到日期 {yd.first_seen} 晚於今日 {today}（時鐘或資料異常）")
             yd.ok = False
             continue
-        age = (today - yd.first_seen).days
-        if yd.year == FSC_YEARS[0] and age > STALE_DAYS:
-            reasons_stale.append(f"{yd.year}年檔此版本首次看到於 {age} 天前（{yd.first_seen}），超過 {STALE_DAYS} 天，可能已不是最新")
+        src_age = (today - yd.first_seen).days
+        cstate, last, why = year_check(rec, yd.year, today)
+        extra_line = ""
+        if cstate == "ok":
+            check_txt = f"最近成功檢查 {last}"
+            if (today - last).days > CHECK_STALE_DAYS:
+                reasons_stale.append(f"{yd.year}年檔：申報進度資料過舊(最後成功檢查 {last}),抓取可能失敗")
+            elif src_age >= SOURCE_NOTE_MIN_DAYS:
+                extra_line = f"    └ 來源 {src_age} 天未更新(最近檢查 {last},正常)"
+                if yd.year == FSC_YEARS[0]:
+                    primary_source_age = src_age
+        else:
+            # 沒有可用的檢查紀錄：不得靜默當成正常；暫時沿用舊規則（只看目前年度檔、此版本首次看到日超過 7 天）
+            check_txt = f"最近成功檢查 {DASH}"
+            fallback_labels.append(why.split("（")[0])
+            if yd.year == FSC_YEARS[0] and src_age > STALE_DAYS:
+                reasons_stale.append(f"{yd.year}年檔：{why}，暫以此版本首次看到日判斷：{src_age} 天前（{yd.first_seen}），超過 {STALE_DAYS} 天，可能已不是最新")
+            else:
+                rep.notes.append(f"⚠️ {yd.year}年檔：{why}，暫以此版本首次看到日判斷（{src_age} 天前，未超過 {STALE_DAYS} 天）")
+        version_lines.append(_version_line(yd, today, check_txt))
+        if extra_line:
+            version_lines.append(extra_line)
     rep.state = "缺失" if reasons_missing else ("過舊" if reasons_stale else "正常")
     rep.reasons = reasons_missing + reasons_stale
+    suffix = ""
+    if fallback_labels:
+        suffix = "（" + "、".join(dict.fromkeys(fallback_labels)) + "，沿用舊規則）"
+    if rep.state != "正常":
+        rep.label = rep.state + suffix
+    elif primary_source_age is not None:
+        rep.label = f"來源 {primary_source_age} 天未更新" + suffix
+    else:
+        rep.label = "正常" + suffix
 
     lines: List[str] = [TITLE, "=" * 60]
     if rep.state != "正常":
@@ -464,10 +556,11 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
         else:
             lines.append("  沒有可用的資料版本，本次不列出任何案件；請檢查 data/fsc（archive-fsc 是否成功、bot/日報的 checkout 是否太舊）")
     good = [y for y in years if y.ok]
-    rep.versions = [_version_line(y, today) for y in good]
+    rep.versions = [ln for ln in version_lines if not ln.startswith("    └")]
     if good:
         lines.append("📦 資料版本（本報告實際使用）：")
-        lines.extend(rep.versions)
+        lines.extend(version_lines)
+        lines.extend(f"  {n}" for n in rep.notes)
 
     cases: List[Case] = []
     anomalies: List[str] = []
@@ -486,6 +579,9 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
             if c is not None:
                 cases.append(c)
                 lookup[c.key] = c
+    same = collections.Counter((c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS)) for c in cases)
+    for c in cases:
+        c.same_n = same[(c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS))]
 
     reviewing = sorted((c for c in cases if c.status == "reviewing"), key=_recv_key)
     lo = today - timedelta(days=RECENT_DAYS)
@@ -499,10 +595,12 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
     n_term = sum(1 for c in cases if c.status == "terminated")
     rep.counts = {"in_scope": len(cases), "reviewing": len(reviewing), "effective_total": n_eff, "terminated_total": n_term,
                   "effective_recent": len(eff_recent), "terminated_recent": len(term_recent), "anomalies": len(anomalies),
+                  "identical_rows": sum(1 for c in cases if c.same_n >= 2),
                   "by_category": dict(by_cat), "diff": {}}
 
     if good:
-        lines.append(f"📊 範圍內 {len(cases)} 列（" + "／".join(f"{k} {v}" for k, v in sorted(by_cat.items())) + "）："
+        scope_txt = "＋".join(y.year for y in good) + "年累計"
+        lines.append(f"📊 範圍內 {len(cases)} 列（{scope_txt}；" + "／".join(f"{k} {v}" for k, v in sorted(by_cat.items())) + "）："
                      f"審理中 {len(reviewing)}、已生效 {n_eff}、已終止 {n_term}、資料異常 {len(anomalies)}")
         lines.append("")
         lines.append(f"⏳ 審理中 {len(reviewing)} 筆（依收文日期新到舊）")
@@ -516,6 +614,8 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
         for yd in good:
             if (today - yd.first_seen).days <= DIFF_DAYS:
                 dl, dc = diff_section(data_dir, yd, lookup)
+                if not dl:                 # 首次留存（沒有前一版）：不顯示這一段
+                    continue
                 rep.counts["diff"][yd.year] = dc
                 lines.append("")
                 lines.extend(dl)
@@ -542,12 +642,12 @@ def build_progress_block(now: Optional[datetime] = None, data_dir: Optional[str]
 
 
 def status_line(now: Optional[datetime] = None, data_dir: Optional[str] = None) -> str:
-    """給 /status：一行資料版本與狀態（正常／過舊／缺失）。絕不拋例外。"""
+    """給 /status：一行資料版本與狀態（正常／來源 N 天未更新／過舊／缺失）。絕不拋例外。"""
     try:
         rep = build_report(now, data_dir)
         ver = rep.versions[0].strip() if rep.versions else "（無可用版本）"
         extra = f"｜{rep.reasons[0]}" if rep.reasons else ""
-        return f"{rep.state}｜{ver}{extra}"
+        return f"{rep.label}｜{ver}{extra}"
     except Exception as e:
         return f"缺失｜讀取失敗（{type(e).__name__}）"
 

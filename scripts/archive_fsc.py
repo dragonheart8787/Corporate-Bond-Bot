@@ -15,6 +15,8 @@
   parsed/<年度>.json                  最新版的完整解析：18 欄原始字串、ISO 日期、案件鍵、重複序號、品質旗標
   meta/<年度>.json                    目前版本的 sha256／大小／頁面更新日期文字／結尾列內容／列數／首見日期（台北時間）
   diffs/<年度>_<舊sha8>_<新sha8>.json 新版本出現時：新增／消失的案件、同鍵欄位變更（結案類型與各日期欄）
+  _last_check.json                    各年度「最後成功檢查日」（台北 YYYY-MM-DD，只有日期）。某年度本次下載、驗證、解析、寫入全部成功
+                                      （無論有無新版本）才更新該年度；失敗的年度日期維持不變。同一台北日重跑逐位元相同；損毀時不覆蓋、報錯。
 parsed／raw 不含任何執行時間戳：同一個檔案重跑，輸出逐位元相同（git diff --staged 為空）。
 首見日期只在新版本第一次出現時寫入 meta，之後不變。
 
@@ -550,6 +552,43 @@ def write_summary(env: Dict[str, str], lines: List[str]) -> None:
 
 
 # ─────────────────────────────────────────
+# 最後成功檢查日（給報告判斷「抓取是否還在運作」：來源多日沒有新版本 ≠ 抓取壞了）
+# ─────────────────────────────────────────
+LAST_CHECK_NAME = "_last_check.json"
+_YEAR_KEY = re.compile(r"\d{3}")
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _valid_day(text: Any) -> bool:
+    if not isinstance(text, str) or not _ISO_DAY.fullmatch(text):
+        return False
+    try:
+        date.fromisoformat(text)
+        return True
+    except ValueError:
+        return False
+
+
+def load_last_check(directory: str) -> Dict[str, str]:
+    """讀 _last_check.json。不存在 → {}；損毀或欄位異常 → ArchiveError（呼叫端不得覆蓋它）。"""
+    path = os.path.join(directory, LAST_CHECK_NAME)
+    obj = read_json(path, "最後檢查紀錄")
+    if obj is None:
+        return {}
+    ok = (isinstance(obj, dict) and obj.get("version") == STORE_VERSION and isinstance(obj.get("years"), dict)
+          and set(obj) == {"version", "years"}
+          and all(isinstance(k, str) and _YEAR_KEY.fullmatch(k) and _valid_day(v) for k, v in obj["years"].items()))
+    if not ok:
+        raise ArchiveError(f"既有的最後檢查紀錄 {path} 結構不符（欄位或日期格式異常），為避免覆蓋，不更新")
+    return dict(obj["years"])
+
+
+def dump_last_check(years: Dict[str, str]) -> bytes:
+    """只有日期（台北 YYYY-MM-DD），沒有時間：同一台北日重跑逐位元相同。"""
+    return dump_meta({"version": STORE_VERSION, "years": dict(sorted(years.items()))})
+
+
+# ─────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────
 def run(
@@ -581,6 +620,14 @@ def run(
     today = clock().astimezone(TAIPEI).date().isoformat()
     failed = 0
     summary: List[str] = []
+    succeeded: List[str] = []         # 本次下載、驗證、解析、寫入全部成功的年度（無論是否有新版本）
+    last_check: Optional[Dict[str, str]]
+    try:
+        last_check = load_last_check(directory)
+    except ArchiveError as e:
+        last_check = None             # 損毀就不覆蓋；年度資料照常處理，最後讓這一步變紅
+        failed += 1
+        log(f"::error title=留存失敗 最後檢查紀錄::{e}")
 
     fr = ps.fetch_once(page_url, ua, opener, accept="text/html, */*;q=0.5")
     log(f"== [頁面] HTTP {fr.status if fr.status is not None else '無回應'}｜{fr.size} bytes")
@@ -631,11 +678,28 @@ def run(
             failed += 1
             log(f"::error title=留存失敗 {label}::未預期的錯誤 {type(e).__name__}: {e}")
             continue
+        succeeded.append(year)
         lines = summarize_year(res)
         summary.extend(lines)
         for ln in lines:
             log(ln)
         log(f"  已寫入 {len(res.wrote)} 個檔案" if res.wrote else "  內容與既有相同，沒有檔案變動")
+
+    # 失敗的年度保持原日期（不得被更新）；已成功的年度記今天（台北）。沒有任何年度成功就不動這個檔。
+    if last_check is not None and succeeded:
+        updated = dict(last_check)
+        for y in succeeded:
+            updated[y] = today
+        try:
+            wrote = write_bytes_atomic(os.path.join(directory, LAST_CHECK_NAME), dump_last_check(updated))
+            msg = "最後成功檢查日：" + "、".join(f"{y}年={updated[y]}" for y in sorted(updated)) + ("" if wrote else "（與既有相同，沒有變動）")
+            summary.append(msg)
+            log(msg)
+        except ArchiveError as e:
+            failed += 1
+            log(f"::error title=留存失敗 最後檢查紀錄::{e}")
+    elif last_check is not None:
+        log("沒有任何年度成功，最後成功檢查日維持不變")
 
     summary.append(f"\n結果：{'有失敗，請看 ::error::' if failed else '全部成功'}")
     write_summary(env, summary)
