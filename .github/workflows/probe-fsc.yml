@@ -11,7 +11,7 @@ on:
       page_url:
         description: "證期局頁面網址（留空用預設；主機須是 sfb.gov.tw / fsc.gov.tw）"
         required: false
-        default: "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0,6,52"
+        default: "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
       dry_run:
         description: "true = 只驗證設定、印出將送出的請求，不連線"
         required: false

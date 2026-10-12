@@ -276,9 +276,172 @@ class TestResolveYearLink(unittest.TestCase):
         self.assertEqual(fs.page_update_text("<p>沒有</p>"), "")
 
 
-# ─────────────────────────────────────────
-# xlsx 讀取
-# ─────────────────────────────────────────
+# 真實頁面的形狀：分類格跨多列（rowspan），所以「115年度申報案件」那一列的儲存格比其他列少，
+# 而且它的「壓縮檔」欄是空的。以下是合成樣本，重現這個形狀。
+ROWSPAN_PAGE = """
+<html><body><p>更新日期：2026-10-08</p>
+<table border="1">
+<tr><th>類別</th><th>年度</th><th>ODS</th><th>XLSX</th><th>壓縮檔</th></tr>
+<tr>
+  <td rowspan="3">公開發行公司申報案件</td>
+  <td>114年度申報案件</td>
+  <td><a href="/userfiles/file/1141231v2.ods">ods</a></td>
+  <td><a href="/userfiles/file/1141231v2.xlsx">114.12.31(v2)</a></td>
+  <td><a href="/userfiles/file/114.zip">zip</a></td>
+</tr>
+<tr>
+  <td>115年度申報案件</td>
+  <td><a href="/userfiles/file/1151008v3.ods">ods</a></td>
+  <td><a href="/userfiles/file/1151008v3.xlsx">115.10.8(v3)</a></td>
+  <td></td>
+</tr>
+<tr>
+  <td>115年度公開發行公司無償配發新股申報生效案件彙總表</td>
+  <td><a href="/userfiles/file/free.ods">ods</a></td>
+  <td><a href="/userfiles/file/free.xlsx">x</a></td>
+  <td>&nbsp;</td>
+</tr>
+<tr>
+  <td rowspan="2">外國發行人案件</td>
+  <td>114年度外國發行人申報案件</td>
+  <td></td><td><a href="/userfiles/file/foreign114.xlsx">x</a></td><td></td>
+</tr>
+<tr><td>115年度外國發行人申報案件</td><td></td><td><a href="/userfiles/file/foreign115.xlsx">x</a></td><td></td></tr>
+</table></body></html>
+"""
+
+
+class TestRowspanAndSloppyHtml(unittest.TestCase):
+    def resolve(self, html, label):
+        return fs.resolve_year_link(html, PAGE_URL, label)
+
+    def test_row_with_fewer_cells_and_empty_trailing_cell_is_found_by_label_text(self):
+        ch = self.resolve(ROWSPAN_PAGE, "115年度申報案件")
+        self.assertEqual(ch.url, "https://www.sfb.gov.tw/userfiles/file/1151008v3.xlsx")
+        self.assertEqual(ch.anchor_text, "115.10.8(v3)")
+
+    def test_cell_counts_really_differ_between_rows(self):
+        rows = {r.cells[0].text: r for r in fs.parse_page(ROWSPAN_PAGE).rows if r.cells}
+        r114 = [r for r in fs.parse_page(ROWSPAN_PAGE).rows if r.cells and r.cells[0].text == "公開發行公司申報案件"][0]
+        r115 = rows["115年度申報案件"]
+        self.assertEqual(len(r114.cells), 5)
+        self.assertEqual(len(r115.cells), 4)                      # 少了跨列的分類格
+        self.assertEqual(r114.cells[0].rowspan, 3)
+        self.assertEqual([c.text for c in r115.cells][-1], "")    # 最後一欄是空的
+
+    def test_the_114_row_is_found_even_though_its_first_cell_is_the_rowspan_category(self):
+        ch = self.resolve(ROWSPAN_PAGE, "114年度申報案件")
+        self.assertEqual(ch.filename, "1141231v2.xlsx")             # 不是同列的 zip，也不是別列的
+
+    def test_never_borrows_a_link_from_a_neighbouring_row(self):
+        # 115 那列沒有 xlsx：不能因為鄰列有 xlsx（欄位位置相同）就拿來用
+        html = ROWSPAN_PAGE.replace('<td><a href="/userfiles/file/1151008v3.xlsx">115.10.8(v3)</a></td>', "<td></td>")
+        with self.assertRaises(fs.FscError) as cm:
+            self.resolve(html, "115年度申報案件")
+        self.assertIn("沒有 .xlsx", str(cm.exception))
+
+    def test_similar_labels_in_other_sections_are_not_candidates(self):
+        # 頁面上另有「115年度外國發行人申報案件」等相似標籤：只有完全相等的那一列算
+        self.assertEqual(self.resolve(ROWSPAN_PAGE, "115年度申報案件").filename, "1151008v3.xlsx")
+        self.assertEqual(self.resolve(ROWSPAN_PAGE, "115年度外國發行人申報案件").filename, "foreign115.xlsx")
+        renamed = ROWSPAN_PAGE.replace("115年度申報案件", "115年度申報案件（補）", 1)
+        with self.assertRaises(fs.FscError) as cm:
+            self.resolve(renamed, "115年度申報案件")
+        self.assertIn("找不到", str(cm.exception))
+
+    def test_xlsx_link_in_any_column_position_is_found(self):
+        for pos in range(1, 5):
+            cells = ["<td></td>"] * 4
+            cells[pos - 1] = '<td><a href="/f/x.xlsx">t</a></td>'
+            html = "<table><tr><td rowspan='2'>分類</td><td>115年度申報案件</td>" + "".join(cells) + "</tr></table>"
+            self.assertEqual(self.resolve(html, "115年度申報案件").filename, "x.xlsx", pos)
+
+    def test_unclosed_td_and_tr_tags(self):
+        html = ("<table>"
+                "<tr><td rowspan=3>公開發行公司申報案件<td>114年度申報案件<td><a href='/a/114.xlsx'>114</a><td>"
+                "<tr><td>115年度申報案件<td><a href='/a/115.ods'>o</a><td><a href='/a/115v3.xlsx'>115</a><td>"
+                "<tr><td>115年度其他<td><a href='/a/other.xlsx'>x</a>"
+                "</table>")
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "115v3.xlsx")
+        self.assertEqual(self.resolve(html, "114年度申報案件").filename, "114.xlsx")
+
+    def test_td_without_tr_and_stray_closing_tags_do_not_crash(self):
+        html = "</td></tr></table><table><td>115年度申報案件<td><a href='/x.xlsx'>x</a></table></tr>"
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "x.xlsx")
+
+    def test_uppercase_tags_attributes_and_whitespace_in_href(self):
+        html = "<TABLE><TR><TD>115年度申報案件</TD><TD><A HREF=' /f/Y.XLSX '>t</A></TD></TR></TABLE>"
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "Y.XLSX")
+
+    def test_nested_table_inside_a_cell_does_not_break_outer_rows(self):
+        html = ("<table><tr><td>說明<table><tr><td>內層</td></tr></table></td><td>x</td></tr>"
+                "<tr><td>115年度申報案件</td><td><a href='/n.xlsx'>t</a></td></tr></table>")
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "n.xlsx")
+
+    def test_nested_table_keeps_outer_row_cells_intact(self):
+        html = ("<table><tr><td>說明<table><tr><td>內層</td></tr></table></td><td>x</td></tr>"
+                "<tr><td>115年度申報案件</td><td><a href='/n.xlsx'>t</a></td></tr></table>")
+        rows = fs.parse_page(html).rows
+        outer = [r for r in rows if len(r.cells) == 2 and r.cells[1].text == "x"]
+        self.assertEqual(len(outer), 1)                           # 外層列沒有被內層的 <tr> 截斷
+        self.assertIn("說明", outer[0].cells[0].text)
+        self.assertTrue(any(len(r.cells) == 1 and r.cells[0].text == "內層" for r in rows))
+
+    def test_rows_without_closing_tags_do_not_leak_across_tables(self):
+        html = "<table><tr><td>A<td>B</table><table><tr><td>115年度申報案件<td><a href='/x.xlsx'>t</table>"
+        rows = fs.parse_page(html).rows
+        self.assertEqual([[c.text for c in r.cells] for r in rows], [["A", "B"], ["115年度申報案件", "t"]])
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "x.xlsx")
+
+    def test_page_truncated_in_the_middle_of_the_last_row_is_still_parsed(self):
+        html = "<table><tr><td>115年度申報案件<td><a href='/x.xlsx'>t"
+        self.assertEqual(self.resolve(html, "115年度申報案件").filename, "x.xlsx")
+
+    def test_link_outside_any_table_is_ignored(self):
+        html = "<a href='/loose.xlsx'>loose</a><table><tr><td>115年度申報案件</td><td></td></tr></table>"
+        with self.assertRaises(fs.FscError):
+            self.resolve(html, "115年度申報案件")
+
+    def test_diagnostics_describe_the_matched_row_shape(self):
+        html = ROWSPAN_PAGE.replace('<a href="/userfiles/file/1151008v3.xlsx">115.10.8(v3)</a>', "")
+        with self.assertRaises(fs.FscError) as cm:
+            self.resolve(html, "115年度申報案件")
+        self.assertTrue(any("目標列有 4 個儲存格" in d and "空白" in d for d in cm.exception.diagnostics))
+
+    def test_probe_over_a_rowspan_page_requests_the_two_resolved_files(self):
+        u115 = "https://www.sfb.gov.tw/userfiles/file/1151008v3.xlsx"
+        u114 = "https://www.sfb.gov.tw/userfiles/file/1141231v2.xlsx"
+        routes = {PAGE_URL: FakeResp(ROWSPAN_PAGE.encode("utf-8")),
+                  u115: FakeResp(good_xlsx(), ctype="application/octet-stream"),
+                  u114: FakeResp(good_xlsx(), ctype="application/octet-stream")}
+        code, out, op, _ = run_probe(routes)
+        self.assertEqual(code, 0, out)
+        self.assertEqual([r[0] for r in op.requests], [PAGE_URL, u115, u114])
+        self.assertNotIn("::error", out)
+
+
+class TestPageUrlForm(unittest.TestCase):
+    def test_default_page_url_uses_the_pages_own_percent_encoded_form(self):
+        self.assertEqual(fs.PAGE_URL, "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52")
+        self.assertNotIn(",", fs.PAGE_URL)
+        self.assertTrue(ps.validate_url(fs.PAGE_URL, fs.FSC_HOSTS)[0])
+
+    def test_probe_requests_exactly_that_url_and_a_redirect_on_it_is_a_failure_not_followed(self):
+        code, out, op, _ = run_probe(happy_routes())
+        self.assertEqual(op.requests[0][0], "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52")
+        h = FakeHeaders({"Location": "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"})
+        err = urllib.error.HTTPError(PAGE_URL, 301, "Moved", h, io.BytesIO(b""))
+        code, out, op, _ = run_probe({PAGE_URL: err})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(op.requests), 1)                    # 轉址沒有被跟隨
+        self.assertIn("被轉址", out)
+
+    def test_workflow_default_is_the_same_encoded_url(self):
+        text = open(os.path.join(ROOT, ".github", "workflows", "probe-fsc.yml"), encoding="utf-8").read()
+        self.assertIn("parentpath=0%2C6%2C52", text)
+        self.assertNotIn("parentpath=0,6,52", text)
+
+
 class TestReadXlsx(unittest.TestCase):
     def test_roundtrip_strings_numbers_and_sheet_names(self):
         sheets = fs.read_xlsx(good_xlsx())

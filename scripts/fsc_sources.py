@@ -25,7 +25,8 @@ from html.parser import HTMLParser
 from typing import Dict, List, Optional, Tuple
 
 FSC_HOSTS = {"www.sfb.gov.tw", "sfb.gov.tw", "www.fsc.gov.tw", "fsc.gov.tw"}
-PAGE_URL = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0,6,52"
+# 用頁面自己使用的編碼形式（逗號寫成 %2C）：探測不跟隨轉址，伺服器若對逗號形式回 3xx 就會直接失敗
+PAGE_URL = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
 
 # 18 欄，依序（欄位名稱照原表，不得改名）
 EXPECTED_COLUMNS = [
@@ -66,6 +67,8 @@ def norm_header(text: str) -> str:
 class Cell:
     text: str = ""
     links: List[Tuple[str, str]] = field(default_factory=list)    # (href, 錨點文字)
+    rowspan: int = 1
+    colspan: int = 1
 
 
 @dataclass
@@ -73,49 +76,107 @@ class Row:
     cells: List[Cell] = field(default_factory=list)
 
 
+def _span(attrs, name: str) -> int:
+    try:
+        return max(1, int(dict(attrs).get(name) or 1))
+    except ValueError:
+        return 1
+
+
 class _PageParser(HTMLParser):
+    """
+    以 <tr> 為單位收集儲存格，**不依賴欄位位置**：rowspan／colspan 會讓同一表格各列的儲存格數不同
+    （例如跨列的分類格只出現在第一列），所以只能靠「儲存格文字」找列、再在同一個 <tr> 內找連結。
+    容忍省略 </td>、</tr>（舊式政府網頁常見）：遇到下一個 <td>／<tr>／</table> 就自動結束前一個。
+    巢狀表格各自獨立（以表格深度區分）。
+    """
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: List[Row] = []
         self.tables = 0
-        self._row_stack: List[Row] = []
-        self._cell_stack: List[Cell] = []
-        self._buf_stack: List[List[str]] = []
-        self._a_href: Optional[str] = None
+        self._depth = 0
+        self._row: Dict[int, Row] = {}
+        self._cell: Dict[int, Tuple[Cell, List[str]]] = {}
+        self._a_open: Optional[Tuple[Cell, int]] = None      # 目前開著的錨點：(所在儲存格, 在 links 中的位置)
         self._a_text: List[str] = []
         self.text_chunks: List[str] = []
 
+    def _finish_anchor(self) -> None:
+        """結束目前的錨點（遇到 </a>、下一個 <a>、儲存格／列結束或文件結束都會呼叫），補上錨點文字。"""
+        if self._a_open is not None:
+            cell, i = self._a_open
+            href, _ = cell.links[i]
+            cell.links[i] = (href, norm_label("".join(self._a_text)))
+        self._a_open = None
+        self._a_text = []
+
+    def _close_cell(self, d: int) -> None:
+        self._finish_anchor()
+        item = self._cell.pop(d, None)
+        if item is not None:
+            cell, buf = item
+            cell.text = norm_label("".join(buf))
+            if d in self._row:
+                self._row[d].cells.append(cell)
+
+    def _close_row(self, d: int) -> None:
+        self._close_cell(d)
+        row = self._row.pop(d, None)
+        if row is not None:
+            self.rows.append(row)
+
+    def _innermost_cell(self) -> Optional[Tuple[Cell, List[str]]]:
+        for d in sorted(self._cell, reverse=True):
+            return self._cell[d]
+        return None
+
     def handle_starttag(self, tag, attrs):
+        d = self._depth
         if tag == "table":
             self.tables += 1
+            self._depth += 1
         elif tag == "tr":
-            self._row_stack.append(Row())
-        elif tag in ("td", "th") and self._row_stack:
-            self._cell_stack.append(Cell())
-            self._buf_stack.append([])
+            self._close_row(d)
+            self._row[d] = Row()
+        elif tag in ("td", "th"):
+            self._close_cell(d)
+            if d not in self._row:          # 沒有 <tr> 的 <td>：補一個隱含的列
+                self._row[d] = Row()
+            self._cell[d] = (Cell(rowspan=_span(attrs, "rowspan"), colspan=_span(attrs, "colspan")), [])
         elif tag == "a":
-            self._a_href = dict(attrs).get("href")
-            self._a_text = []
+            self._finish_anchor()
+            inner = self._innermost_cell()
+            href = dict(attrs).get("href")
+            if href is not None and inner is not None:
+                inner[0].links.append((href.strip(), ""))
+                self._a_open = (inner[0], len(inner[0].links) - 1)
 
     def handle_endtag(self, tag):
-        if tag in ("td", "th") and self._cell_stack:
-            cell = self._cell_stack.pop()
-            cell.text = norm_label("".join(self._buf_stack.pop()))
-            if self._row_stack:
-                self._row_stack[-1].cells.append(cell)
-        elif tag == "tr" and self._row_stack:
-            self.rows.append(self._row_stack.pop())
+        d = self._depth
+        if tag in ("td", "th"):
+            self._close_cell(d)
+        elif tag == "tr":
+            self._close_row(d)
+        elif tag == "table" and self._depth > 0:
+            self._close_row(d)
+            self._depth -= 1
         elif tag == "a":
-            if self._a_href is not None and self._cell_stack:
-                self._cell_stack[-1].links.append((self._a_href, norm_label("".join(self._a_text))))
-            self._a_href = None
+            self._finish_anchor()
 
     def handle_data(self, data):
         self.text_chunks.append(data)
-        if self._buf_stack:
-            self._buf_stack[-1].append(data)
-        if self._a_href is not None:
+        inner = self._innermost_cell()
+        if inner is not None:
+            inner[1].append(data)
+        if self._a_open is not None:
             self._a_text.append(data)
+
+    def close(self):
+        super().close()
+        self._finish_anchor()
+        for d in sorted(set(self._row) | set(self._cell), reverse=True):
+            self._close_row(d)
 
 
 def parse_page(html: str) -> _PageParser:
@@ -154,6 +215,8 @@ def resolve_year_link(html: str, page_url: str, label: str, allowed: Optional[se
     if len(matches) > 1:
         raise FscError(f"頁面上有 {len(matches)} 列的儲存格文字完全等於「{target}」，無法確定是哪一列", diag)
     row = matches[0]
+    empty = sum(1 for c in row.cells if not c.text and not c.links)
+    diag.append(f"目標列有 {len(row.cells)} 個儲存格（其中空白 {empty} 個；有 rowspan 的格 {sum(1 for c in row.cells if c.rowspan > 1)} 個）")
     links = [(h, t) for c in row.cells for (h, t) in c.links]
     xlsx = []
     for href, text in links:
