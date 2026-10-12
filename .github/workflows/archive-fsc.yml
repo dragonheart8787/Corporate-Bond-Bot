@@ -1,0 +1,77 @@
+name: 留存證期局申報案件彙總表（只存檔，不發訊息）
+
+# 目的：每天抓金管會證期局「申報案件辦理情形彙總表」的 115、114 兩個年度 xlsx，原檔逐位元留存，
+# 並產生完整解析（parsed）、版本資訊（meta）與新舊版差異（diffs），供之後離線評估。只留存，不接進日報、不接進 /cb。
+# 為什麼 114 年也要每天查：該檔在 2026 年仍會被更新，不是一次性。
+#
+# 請求：頁面 1 次 + 兩個年度 xlsx 各 1 次（共 ≤ 3 次），間隔 ≥ 6 秒，不跟隨轉址，不重試；xlsx 連結每次從頁面解析。
+# 不使用任何 secrets、不碰 Telegram、不觸發其他 workflow。唯一的寫入是把 data/fsc/ 提交回分支。
+# 資料使用條款見 data/fsc/SOURCE.md（引用須註明來源、不得任意增刪、不得商業使用）。
+on:
+  schedule:
+    # UTC 01:29（台北 09:29）與 09:43（台北 17:43）：避開整點、:30，也避開 bot／daily／archive-announcements 已用的分鐘。
+    # GitHub 排程常延遲、偶爾略過，所以兩班；腳本冪等（同一版本重跑輸出逐位元相同、沒變更就不提交），多跑沒有副作用。
+    - cron: "29 1 * * *"
+    - cron: "43 9 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = 只驗證設定、印出將送出的請求，不連線、不寫檔"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+# contents: write 僅為把存檔提交回分支；沒有 actions: write，沒有其他權限。
+permissions:
+  contents: write
+
+concurrency:
+  group: archive-fsc
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      # 某個年度失敗也不能讓另一個年度已成功的資料白抓：腳本把成功的年度寫完、整體以非 0 結束，
+      # 這裡用 continue-on-error 讓後面的提交照跑，最後再由「失敗閘門」把 run 變紅。
+      - name: 🗄️ 抓取並存檔（頁面 1 + xlsx 2，間隔 ≥ 6 秒，不重試）
+        id: archive
+        continue-on-error: true
+        env:
+          ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          PROBE_REPO: ${{ github.repository }}
+        run: python3 scripts/archive_fsc.py
+
+      - name: 📝 提交存檔（pull --rebase、重試；最終失敗會讓 run 變紅）
+        if: ${{ !cancelled() && steps.archive.outcome != 'skipped' }}
+        env:
+          # 不走預設的 Telegram 告警：本 workflow 不碰 Telegram，最終失敗只靠 ::error:: 與紅色 run
+          PUSH_ALERT_CMD: "echo"
+          PUSH_FAIL_MESSAGE: "證期局申報彙總表已抓取但 data/fsc 推送失敗。該檔仍是最新版時重跑即可補回；若期間被新版取代，舊版的差異將無法重建，請盡快手動重跑。run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          # 目錄可能不存在（dry_run、或所有年度都失敗而什麼都沒寫）：git add 對不存在的路徑會直接 fatal
+          mkdir -p data/fsc
+          git add data/fsc
+          if git diff --staged --quiet; then
+            echo "無變更，略過 commit"
+            exit 0
+          fi
+          git commit -m "archive: 證期局申報彙總表 $(TZ=Asia/Taipei date +%F)"
+          bash scripts/push_with_retry.sh
+
+      - name: 🚦 失敗閘門（抓取有任何失敗就讓 run 變紅）
+        if: ${{ always() && steps.archive.outcome == 'failure' }}
+        run: |
+          echo "::error title=證期局申報彙總表留存有失敗::上方 [抓取並存檔] 步驟有年度失敗或結構異常，詳見其 ::error:: 訊息。成功的年度已提交。"
+          exit 1
