@@ -22,6 +22,9 @@ outputs/
 *.xls
 *.csv
 
+# 例外：證期局原始檔必須入庫（archive-fsc 逐位元留存；使用條款要求保持資料完整性）
+!data/fsc/raw/*.xlsx
+
 # 日誌
 *.log
 

@@ -63,6 +63,21 @@ jobs:
           # 目錄可能不存在（dry_run、或所有年度都失敗而什麼都沒寫）：git add 對不存在的路徑會直接 fatal
           mkdir -p data/fsc
           git add data/fsc
+          # 防呆：raw/ 內每個原始檔都必須已進索引。被 .gitignore（例如 *.xlsx）忽略時 git add 不會報錯、只會靜默略過，
+          # 原檔就會隨 runner 消失；這裡讓它變成明確的 ::error:: 並中止（meta／parsed 也不提交，避免「有解析、沒原檔」的半套資料）
+          if [ -d data/fsc/raw ]; then
+            untracked=0
+            for f in data/fsc/raw/*; do
+              [ -e "$f" ] || continue
+              if ! git ls-files --error-unmatch -- "$f" > /dev/null 2>&1; then
+                echo "::error title=原始檔未被 git 追蹤::$f 不在索引中（可能被 .gitignore 忽略）。原始檔必須入庫，本次不提交任何 data/fsc 變更"
+                untracked=1
+              fi
+            done
+            if [ "$untracked" -ne 0 ]; then
+              exit 1
+            fi
+          fi
           if git diff --staged --quiet; then
             echo "無變更，略過 commit"
             exit 0

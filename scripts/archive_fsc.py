@@ -64,7 +64,7 @@ F_NONEXISTENT = "日期不存在"
 F_UNPARSEABLE = "日期無法解析"
 F_LATER = "日期晚於來源更新日"
 F_MULTI_IN_ONE = "單一日期欄含多值"
-F_AMOUNT_CHANGE = "疑似金額變更"
+F_AMOUNT_CHANGE = "同日同類別多筆"          # 同 證券代號+案件類別+收文日期 出現不同金額的多筆（中性名稱：只標記事實，不推論是金額變更）
 F_AMOUNT_NONNUM = "金額非純數字"
 F_PRICE_NONNUM = "發行價格非純數字"
 F_EXTRA_CELLS = "表頭外有資料"
@@ -204,7 +204,8 @@ class SheetParse:
     header_row: int                                   # 1 起算
     data: List[Tuple[int, List[str], List[str]]]      # (列號, 18 欄原始字串, 表頭外的非空儲存格)
     trailer: List[Dict[str, Any]]
-    blank_rows: int
+    blank_rows: int                                   # 表頭之後所有全空列（含資料列之間與結尾）
+    trailing_blank_rows: int                          # 其中「最後一筆資料之後」的全空列
     total_rows: int
 
 
@@ -265,13 +266,14 @@ def parse_sheet(data: bytes) -> SheetParse:
             continue
         extra_cells = [c.value for c in row[n:] if fs.norm_label(c.value)]
         rows.append((rn, vals(row), extra_cells))
-    blank += sum(1 for rn, row in body[tail_start:] if not any(fs.norm_label(x.value) for x in row))
+    trailing_blank = sum(1 for rn, row in body[tail_start:] if not any(fs.norm_label(x.value) for x in row))
+    blank += trailing_blank
     for rn, v, _ in rows:
         if not fs.norm_label(v[code_i]):
             raise ArchiveError(f"第 {rn} 列的證券代號空白（資料列不得缺證券代號），不寫入")
     if not rows:
         raise ArchiveError("表頭之後沒有任何資料列，不寫入")
-    return SheetParse(sheet.name, h + 1, rows, trailer, blank, len(sheet.rows))
+    return SheetParse(sheet.name, h + 1, rows, trailer, blank, trailing_blank, len(sheet.rows))
 
 
 def build_case_rows(sp: SheetParse, ref_iso: Optional[str]) -> List[Dict[str, Any]]:
@@ -438,7 +440,8 @@ def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_t
         "header_row": sp.header_row,
         "columns": list(fs.EXPECTED_COLUMNS),
         "trailer_rows": sp.trailer,
-        "row_counts": {"sheet_rows": sp.total_rows, "data_rows": len(rows), "trailer_rows": len(sp.trailer), "blank_rows": sp.blank_rows},
+        "row_counts": {"sheet_rows": sp.total_rows, "data_rows": len(rows), "trailer_rows": len(sp.trailer),
+                       "trailing_blank_rows": sp.trailing_blank_rows, "blank_rows": sp.blank_rows},
         "first_seen": entry["first_seen"],
         "history": history,
     }
@@ -496,12 +499,15 @@ def summarize_year(res: YearResult) -> List[str]:
     rows, m = res.rows, res.meta
     out = [f"### {res.label}（{res.status}）"]
     rc = m["row_counts"]
-    out.append(f"- 版本 sha8={m['sha256'][:8]}｜大小 {m['size']} bytes｜資料列 {rc['data_rows']}、結尾非資料列 {rc['trailer_rows']}、空白列 {rc['blank_rows']}｜首見日期 {m['first_seen']}｜來源更新日 {m['reference_date'] or '（無法判定）'}")
+    trail_total = rc["trailer_rows"] + rc.get("trailing_blank_rows", 0)
+    out.append(f"- 版本 sha8={m['sha256'][:8]}｜大小 {m['size']} bytes｜資料列 {rc['data_rows']}、結尾列 {trail_total}"
+               f"（含文字 {rc['trailer_rows']} + 全空 {rc.get('trailing_blank_rows', 0)}）、全部空白列 {rc['blank_rows']}"
+               f"｜首見日期 {m['first_seen']}｜來源更新日 {m['reference_date'] or '（無法判定）'}")
     for t in m["trailer_rows"]:
         txt = " / ".join(c["value"] for c in t["cells"])
-        out.append(f"- 結尾非資料列 第 {t['row']} 列：{txt[:MAX_TRAILER_LOG_CHARS]}")
-    if rc["trailer_rows"] != 2:
-        out.append(f"- ⚠ 結尾非資料列數為 {rc['trailer_rows']}（先前確認為 2），請確認格式是否改變")
+        out.append(f"- 結尾列（含文字）第 {t['row']} 列：{txt[:MAX_TRAILER_LOG_CHARS]}")
+    if trail_total != 2:
+        out.append(f"- ⚠ 結尾列合計 {trail_total}（含文字 {rc['trailer_rows']} + 全空 {rc.get('trailing_blank_rows', 0)}；先前確認為 2），請確認格式是否改變（提示，不是失敗）")
     for col in ("案件類別", "結案類型"):
         cnt = collections.Counter(fs.norm_label(r["fields"][col]) or "（空）" for r in rows)
         out.append(f"- {col}（{len(cnt)} 種）：" + "；".join(f"{k}×{v}" for k, v in cnt.most_common(40)))
