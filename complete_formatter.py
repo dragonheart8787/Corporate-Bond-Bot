@@ -12,6 +12,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
 
+from fsc_progress import build_progress_block
 from telegram_date_utils import (
     COMPANY_RE,
     PUBLISH_TIME_RE,
@@ -278,6 +279,11 @@ class CompleteFormatter:
                 result.append(f"【轉換公司債 - 第 {i} 則】")
                 result.append(self.format_single_announcement(row, i))
         
+        # 1b. 金管會申報進度（轉換公司債三類）：放在轉換公司債區塊內、其他公告之前。
+        #     有無轉換公司債公告都要有（沒有公告的日子更需要看進度）；資料缺失／過舊時區塊內明確顯示，不會省略。
+        result.append(build_progress_block())
+        result.append("")
+
         # 2. 其他公告按分類顯示
         if other_announcements:
             result.append("📋 其他公告")

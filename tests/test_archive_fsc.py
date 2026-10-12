@@ -141,7 +141,7 @@ class TestParsing(Base):
         code, out, op, sleeps = self.run_archive(routes())
         self.assertEqual(code, 0, out)
         names = sorted(self.tree())
-        self.assertEqual([n.split("/")[0] for n in names], ["meta", "meta", "parsed", "parsed", "raw", "raw"])
+        self.assertEqual([n.split("/")[0] for n in names], ["_last_check.json", "meta", "meta", "parsed", "parsed", "raw", "raw"])
         rows = self.parsed()["rows"]
         self.assertEqual(len(rows), 4)                                   # 沒有依案件類別篩選
         self.assertEqual({r["fields"]["案件類別"] for r in rows}, {"現金增資", "公司債", "海外存託憑證"})
@@ -369,8 +369,10 @@ class TestIdempotencyAndVersions(Base):
         later = datetime(2031, 7, 4, 3, 0, tzinfo=TAIPEI)
         code, out, *_ = self.run_archive(routes(page=page_with("2030-01-01")), clock=later)
         self.assertEqual(code, 0)
-        self.assertEqual(self.tree(), first)                               # git diff --staged 會是空的
+        strip = lambda t: {k: v for k, v in t.items() if k != "_last_check.json"}
+        self.assertEqual(strip(self.tree()), strip(first))                  # 資料檔逐位元相同（隔了很多年也一樣）
         self.assertEqual(out.count("內容與既有相同，沒有檔案變動"), 2)
+        self.assertNotEqual(self.tree()["_last_check.json"], first["_last_check.json"])      # 只有「最後成功檢查日」會跟著日期走
 
     def test_no_run_timestamp_in_parsed_or_raw_and_first_seen_only_in_meta(self):
         self.clock = datetime(2031, 7, 4, 3, 0, tzinfo=TAIPEI)
@@ -493,6 +495,128 @@ class TestIdempotencyAndVersions(Base):
         with open(os.path.join(self.dir, raw), "rb") as f:
             self.assertEqual(f.read(), b"tampered")
 
+
+# ─────────────────────────────────────────
+# 最後成功檢查日
+# ─────────────────────────────────────────
+class TestLastCheck(Base):
+    def lc(self):
+        with open(os.path.join(self.dir, "_last_check.json"), "rb") as f:
+            return f.read()
+
+    def years(self):
+        return json.loads(self.lc())["years"]
+
+    def day(self, n):
+        return datetime(2026, 10, 12, 9, 0, tzinfo=TAIPEI) + timedelta(days=n)
+
+    def test_written_after_success_with_taipei_date_and_nothing_else(self):
+        code, out, *_ = self.run_archive(routes(), clock=datetime(2026, 10, 11, 17, 30, tzinfo=timezone.utc))      # = 台北 10-12 01:30
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(self.lc()), {"version": 1, "years": {"114": "2026-10-12", "115": "2026-10-12"}})
+        self.assertNotRegex(self.lc().decode(), r"\d{2}:\d{2}")               # 只有日期，沒有時間
+        self.assertIn("最後成功檢查日：114年=2026-10-12、115年=2026-10-12", out)
+
+    def test_same_taipei_day_rerun_is_byte_identical_even_at_another_time(self):
+        self.run_archive(routes(), clock=self.day(0))
+        first = self.lc()
+        code, out, *_ = self.run_archive(routes(), clock=self.day(0) + timedelta(hours=12))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.lc(), first)
+        self.assertIn("與既有相同，沒有變動", out)
+
+    def test_updated_on_a_new_day_even_when_the_source_did_not_change(self):
+        self.run_archive(routes(), clock=self.day(0))
+        before = {k: v for k, v in self.tree().items() if k != "_last_check.json"}
+        code, out, *_ = self.run_archive(routes(), clock=self.day(5))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.years(), {"114": "2026-10-17", "115": "2026-10-17"})
+        self.assertEqual({k: v for k, v in self.tree().items() if k != "_last_check.json"}, before)
+
+    def test_a_failing_year_keeps_its_old_date_and_the_other_year_advances(self):
+        self.run_archive(routes(), clock=self.day(0))
+        r = routes()
+        r[URL114] = FakeResp(b"garbage", ctype="application/octet-stream")
+        code, out, *_ = self.run_archive(r, clock=self.day(2))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.years(), {"114": "2026-10-12", "115": "2026-10-14"})
+        r = routes()
+        r[URL115] = http_error(URL115, 500)
+        self.assertEqual(self.run_archive(r, clock=self.day(3))[0], 1)
+        self.assertEqual(self.years(), {"114": "2026-10-15", "115": "2026-10-14"})
+
+    def test_a_year_that_never_succeeded_has_no_date_and_is_not_invented(self):
+        r = routes()
+        r[URL114] = http_error(URL114, 404)
+        self.assertEqual(self.run_archive(r, clock=self.day(0))[0], 1)
+        self.assertEqual(self.years(), {"115": "2026-10-12"})
+
+    def test_year_failing_after_download_still_does_not_advance(self):
+        self.run_archive(routes(), clock=self.day(0))
+        bad = xlsx(base_rows(), header=HEADER[:-1])                # 表頭不符 → fail-closed
+        self.assertEqual(self.run_archive(routes(x115=bad), clock=self.day(1))[0], 1)
+        self.assertEqual(self.years(), {"114": "2026-10-13", "115": "2026-10-12"})
+        rows = [data_row(code=str(1000 + i)) for i in range(10)]            # 資料列驟減 → 拒絕
+        self.run_archive(routes(x115=xlsx(rows)), clock=self.day(2))
+        self.assertEqual(self.run_archive(routes(x115=xlsx(rows[:5])), clock=self.day(3))[0], 1)
+        self.assertEqual(self.years()["115"], "2026-10-14")
+
+    def test_nothing_is_written_when_every_year_or_the_page_fails(self):
+        self.run_archive(routes(), clock=self.day(0))
+        before = self.lc()
+        r = routes()
+        r[URL115] = http_error(URL115, 500)
+        r[URL114] = http_error(URL114, 500)
+        self.assertEqual(self.run_archive(r, clock=self.day(4))[0], 1)
+        self.assertEqual(self.lc(), before)
+        self.assertEqual(self.run_archive({PAGE_URL: http_error(PAGE_URL, 403)}, clock=self.day(4))[0], 1)
+        self.assertEqual(self.lc(), before)
+
+    def test_no_record_is_created_when_nothing_succeeded(self):
+        r = routes()
+        r[URL115] = http_error(URL115, 500)
+        r[URL114] = http_error(URL114, 500)
+        self.assertEqual(self.run_archive(r, clock=self.day(0))[0], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "_last_check.json")))
+        self.assertEqual(self.run_archive({PAGE_URL: http_error(PAGE_URL, 403)}, clock=self.day(0))[0], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "_last_check.json")))
+
+    def test_dry_run_writes_nothing(self):
+        self.assertEqual(self.run_archive(routes(), env={"ARCHIVE_DRY_RUN": "1"})[0], 0)
+        self.assertFalse(os.path.exists(self.dir))
+
+    def test_corrupt_or_malformed_record_is_never_overwritten_and_turns_the_step_red(self):
+        good = {"version": 1, "years": {"115": "2026-10-01"}}
+        bads = ["{broken", "[]", "{}", json.dumps({"years": {}}), json.dumps({"version": 2, "years": {}}),
+                json.dumps({"version": 1, "years": []}), json.dumps({**good, "extra": 1}),
+                json.dumps({"version": 1, "years": {"11": "2026-10-01"}}), json.dumps({"version": 1, "years": {"115": "2026-13-01"}}),
+                json.dumps({"version": 1, "years": {"115": "2026-1-1"}}), json.dumps({"version": 1, "years": {"115": 20261001}}),
+                json.dumps({"version": 1, "years": {"115": "2026-10-01T09:00:00"}})]
+        for i, bad in enumerate(bads):
+            d = os.path.join(self.tmp, f"c{i}")
+            os.makedirs(d)
+            with open(os.path.join(d, "_last_check.json"), "w", encoding="utf-8") as f:
+                f.write(bad)
+            code, out, *_ = self.run_archive(routes(), env={"ARCHIVE_FSC_DIR": d})
+            self.assertEqual(code, 1, bad)
+            self.assertIn("::error title=留存失敗 最後檢查紀錄", out)
+            with open(os.path.join(d, "_last_check.json"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), bad)
+            self.assertTrue(os.path.exists(os.path.join(d, "meta", "115.json")), bad)       # 年度資料照常留存
+
+    def test_other_years_in_the_record_are_preserved(self):
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "_last_check.json"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"version": 1, "years": {"113": "2025-01-02", "115": "2026-10-01"}}))
+        self.assertEqual(self.run_archive(routes(), clock=self.day(0))[0], 0)
+        self.assertEqual(self.years(), {"113": "2025-01-02", "114": "2026-10-12", "115": "2026-10-12"})
+
+    def test_a_future_date_in_the_record_is_corrected_to_today(self):
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "_last_check.json"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"version": 1, "years": {"115": "2030-01-01"}}))
+        self.run_archive(routes(), clock=self.day(0))
+        self.assertEqual(self.years()["115"], "2026-10-12")
 
 # ─────────────────────────────────────────
 # fail-closed
@@ -905,16 +1029,30 @@ class TestCommitStepActuallyRuns(unittest.TestCase):
         self.assertTrue(any(n.startswith("data/fsc/parsed/115") for n in tree), tree)
         self.assertTrue(any(n.startswith("data/fsc/raw/114_") for n in tree), tree)
         self.assertRegex(self.git(self.work, "log", "-1", "--format=%s").stdout, r"^archive: 證期局申報彙總表 \d{4}-\d{2}-\d{2}")
-        # 第二次：隔天、頁面文字不同、同一個檔 → git diff --staged 必須是空的
+        # 第二次：同一台北日、頁面文字不同、同一個檔 → git diff --staged 必須是空的，且步驟印「無變更，略過 commit」
         op = RoutedOpener(routes(page=page_with("2030-01-01")))
         with contextlib.redirect_stdout(io.StringIO()):
             af.run({"PROBE_REPO": "o/r", "ARCHIVE_FSC_DIR": os.path.join(self.work, "data", "fsc")}, opener=op, sleep=lambda s: None,
-                   now=lambda: datetime(2031, 1, 1, tzinfo=TAIPEI))
+                   now=lambda: datetime(2026, 10, 12, 21, 0, tzinfo=TAIPEI))
         self.git(self.work, "add", "data/fsc")
         self.assertEqual(self.git(self.work, "diff", "--staged", "--stat").stdout.strip(), "")
         r2 = self.run_step()
         self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
         self.assertIn("無變更", r2.stdout)
+
+    def test_next_day_with_unchanged_source_commits_only_the_last_check_file(self):
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        self.assertEqual(self.run_step().returncode, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            af.run({"PROBE_REPO": "o/r", "ARCHIVE_FSC_DIR": os.path.join(self.work, "data", "fsc")}, opener=RoutedOpener(routes()), sleep=lambda s: None,
+                   now=lambda: datetime(2026, 10, 13, 9, 0, tzinfo=TAIPEI))
+        r = self.run_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("push 成功", r.stdout)
+        changed = self.git(self.work, "show", "--name-only", "--format=", "HEAD").stdout.split()
+        self.assertEqual(changed, ["data/fsc/_last_check.json"])
+        shown = self.git(self.tmp, "--git-dir", self.remote, "show", "master:data/fsc/_last_check.json").stdout
+        self.assertEqual(json.loads(shown)["years"], {"114": "2026-10-13", "115": "2026-10-13"})
 
     def test_every_path_the_archive_writes_is_not_ignored_by_the_real_gitignore(self):
         self.assertEqual(self.archive_into_work(routes()), 0)
@@ -928,7 +1066,7 @@ class TestCommitStepActuallyRuns(unittest.TestCase):
         for r, _, fl in os.walk(os.path.join(self.work, "data", "fsc")):
             paths += [os.path.relpath(os.path.join(r, f), self.work) for f in fl]
         kinds = {p.split("/")[2] for p in paths}
-        self.assertEqual(kinds, {"raw", "parsed", "meta", "diffs", "SOURCE.md"})
+        self.assertEqual(kinds, {"raw", "parsed", "meta", "diffs", "SOURCE.md", "_last_check.json"})
         for p in sorted(paths):
             r = self.git(self.work, "check-ignore", "-v", p)
             # 回傳 1 = 沒有任何規則命中；回傳 0 時 -v 會顯示命中的規則，開頭是 ! 的是「例外」規則（= 不被忽略）

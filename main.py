@@ -22,6 +22,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from bot_relay import redact   # 例外訊息可能含帶 token 的請求網址，輸出前一律遮罩
+from fsc_progress import append_progress_block
+from message_split import split_message
 from telegram_date_utils import report_yyyymmdd
 
 # 與 quick_format / exporter 一致，避免「固定 UTC+8」與 IANA 時區在邊界日期不一致
@@ -118,7 +120,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     import requests
     import time
 
-    chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
+    chunks = split_message(text)     # 只在換行處切，案件的兩行不拆開（見 message_split.py）
     total = len(chunks)
     failed = []
 
@@ -264,7 +266,8 @@ def filter_cb_only(full_report: str) -> str:
             break
 
     if cb_start == -1:
-        return f"📊 公司債每日報告 {date_str}\n\n今日無轉換公司債相關公告。"
+        # 沒有公告的日子仍要帶申報進度區塊（_is_empty_result 看的是下面這句，維持不變）
+        return append_progress_block(f"📊 公司債每日報告 {date_str}\n\n今日無轉換公司債相關公告。", full_report)
 
     # ── 找 CB 區段的結尾（下一個非CB類別開頭）──
     OTHER_SECTION_MARKERS = [
