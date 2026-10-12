@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import bot_relay as relay
+from fsc_progress import append_progress_block, status_line as fsc_status_line
 from telegram_date_utils import report_yyyymmdd
 
 TW = timezone(timedelta(hours=8))
@@ -218,7 +219,8 @@ def filter_cb_only(full_report: str) -> str:
             break
 
     if cb_start == -1:
-        return f"📊 公司債報告 {date_str}\n\n今日無轉換公司債相關公告。"
+        # 沒有公告的日子仍要帶申報進度區塊（_is_empty_result 看的是下面這句，維持不變）
+        return append_progress_block(f"📊 公司債報告 {date_str}\n\n今日無轉換公司債相關公告。", full_report)
 
     cb_end = len(full_report)
     for m in CB_END:
@@ -865,6 +867,7 @@ def main() -> int:
                     f"🕐 現在時間：{now_tw}\n"
                     f"⏱  已運行：{uptime} 分鐘\n"
                     f"📊 報告更新：{updated}\n"
+                    f"📑 申報進度資料：{fsc_status_line()}\n"
                     f"📡 即時抓取：{'已設定' if can_run_fetch() else '未設定（僅 GitHub）'}\n"
                     f"📅 自動排程：每日台北 18:23 起，另有 19:37／20:53／22:47 三班備援（GitHub 排程常延遲數小時，偶爾會整個略過，先成功的那班會發送、其餘略過）",
                 )
