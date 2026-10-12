@@ -284,11 +284,16 @@ def row_label(c: Case) -> str:
     return f"{c.code} {name}｜{short_category(c.category)}"
 
 
+def is_stop_effect(c: Case) -> bool:
+    """審理中且停止生效日期有值、生效日期無值 → 「停止生效」（區塊與每則公告的申報表查詢行共用這一條）。"""
+    return c.status == "reviewing" and bool(c.get("停止生效日期")) and not c.get("生效日期")
+
+
 def reviewing_lines(c: Case) -> List[str]:
     f = c.fields
     stop, lift, eff = c.get("停止生效日期"), c.get("解除生效日期"), c.get("生效日期")
     tags = []
-    if stop and not eff:
+    if is_stop_effect(c):
         tags.append("停止生效")
     if "同日同類別多筆" in c.flags:
         tags.append("同日同類別多筆")
@@ -494,17 +499,29 @@ def _version_line(yd: YearData, today: date, check_txt: str) -> str:
             f"｜此版本首次看到 {yd.first_seen}（{age_txt}）｜{check_txt}｜sha {str(m.get('sha256'))[:8]}｜{norm(m.get('filename_decoded')) or DASH}")
 
 
-def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None) -> ProgressReport:
-    data_dir = data_dir or default_data_dir()
-    today = taipei_today(now)
-    rep = ProgressReport()
-    years = [load_year(data_dir, y) for y in FSC_YEARS]
-    rec = load_last_check(data_dir)
-    reasons_missing: List[str] = []
-    reasons_stale: List[str] = []
-    fallback_labels: List[str] = []
-    version_lines: List[str] = []
+@dataclass
+class Assessment:
+    """資料來源的健康評估（區塊與「每則公告的申報表查詢行」共用同一套判定，不各自實作）。"""
+    years: List[YearData] = field(default_factory=list)
+    reasons_missing: List[str] = field(default_factory=list)
+    reasons_stale: List[str] = field(default_factory=list)
+    fallback_labels: List[str] = field(default_factory=list)
+    version_lines: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    checks: Dict[str, Tuple[str, Optional[date]]] = field(default_factory=dict)   # 年度 → (檢查紀錄狀態 ok|missing|corrupt, 最後成功檢查日)
     primary_source_age: Optional[int] = None
+
+    @property
+    def state(self) -> str:
+        return "缺失" if self.reasons_missing else ("過舊" if self.reasons_stale else "正常")
+
+
+def assess_sources(today: date, data_dir: str) -> Assessment:
+    asm = Assessment()
+    years = asm.years = [load_year(data_dir, y) for y in FSC_YEARS]
+    rec = load_last_check(data_dir)
+    reasons_missing, reasons_stale = asm.reasons_missing, asm.reasons_stale
+    fallback_labels, version_lines = asm.fallback_labels, asm.version_lines
     for yd in years:
         if not yd.ok:
             reasons_missing.append(f"{yd.year}年檔：{yd.error}")
@@ -523,7 +540,7 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
             elif src_age >= SOURCE_NOTE_MIN_DAYS:
                 extra_line = f"    └ 來源 {src_age} 天未更新(最近檢查 {last},正常)"
                 if yd.year == FSC_YEARS[0]:
-                    primary_source_age = src_age
+                    asm.primary_source_age = src_age
         else:
             # 沒有可用的檢查紀錄：不得靜默當成正常；暫時沿用舊規則（只看目前年度檔、此版本首次看到日超過 7 天）
             check_txt = f"最近成功檢查 {DASH}"
@@ -531,10 +548,22 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
             if yd.year == FSC_YEARS[0] and src_age > STALE_DAYS:
                 reasons_stale.append(f"{yd.year}年檔：{why}，暫以此版本首次看到日判斷：{src_age} 天前（{yd.first_seen}），超過 {STALE_DAYS} 天，可能已不是最新")
             else:
-                rep.notes.append(f"⚠️ {yd.year}年檔：{why}，暫以此版本首次看到日判斷（{src_age} 天前，未超過 {STALE_DAYS} 天）")
+                asm.notes.append(f"⚠️ {yd.year}年檔：{why}，暫以此版本首次看到日判斷（{src_age} 天前，未超過 {STALE_DAYS} 天）")
+        asm.checks[yd.year] = (cstate, last)
         version_lines.append(_version_line(yd, today, check_txt))
         if extra_line:
             version_lines.append(extra_line)
+    return asm
+
+
+def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None) -> ProgressReport:
+    data_dir = data_dir or default_data_dir()
+    today = taipei_today(now)
+    rep = ProgressReport()
+    asm = assess_sources(today, data_dir)
+    years, reasons_missing, reasons_stale = asm.years, asm.reasons_missing, asm.reasons_stale
+    fallback_labels, version_lines, primary_source_age = asm.fallback_labels, asm.version_lines, asm.primary_source_age
+    rep.notes = list(asm.notes)
     rep.state = "缺失" if reasons_missing else ("過舊" if reasons_stale else "正常")
     rep.reasons = reasons_missing + reasons_stale
     suffix = ""
@@ -671,3 +700,121 @@ def append_progress_block(message: str, full_report: str) -> str:
     訊息本身（含供 _is_empty_result 判斷的那句話）原樣保留。"""
     block = extract_progress_block(full_report)
     return f"{message}\n\n{block}" if block else message
+
+
+# ─────────────────────────────────────────
+# 每則轉換公司債公告底下的「申報表」查詢行
+# ─────────────────────────────────────────
+LOOKUP_HEAD = "📑 申報表："
+LOOKUP_MAX_ROWS = 5
+AMBIGUOUS_NOTE = "同證券代號全部案件，未判斷對應哪一次"
+CODE_RE = re.compile(r"\d{4,6}")          # 純數字代號（上市櫃股票 4 碼；留 5～6 碼的彈性）。其餘一律視為無法辨識，不猜
+
+
+class AnnouncementLookup:
+    """
+    以公告的證券代號（結構化欄位，不用公司名稱、不比對標題）查詢 data/fsc 的 115 與 114 年資料中
+    「轉換公司債(」開頭的同代號所有列。**不判斷哪一筆對應該則公告**：同代號的全部案件都列出，並註明。
+
+    建構時只讀一次本機檔案（同一份報告內所有公告共用同一個評估結果與同一個「現在」）；建構與 lines_for 都不會拋例外，
+    也不會發任何網路請求。資料缺失／損毀／過舊（沿用既有判定 assess_sources）時不查詢，明確寫出原因，不拿可能過時的結果當最新。
+    """
+
+    def __init__(self, now: Optional[datetime] = None, data_dir: Optional[str] = None):
+        self.error = ""
+        self.version_txt = ""
+        self.unreadable = 0                      # 屬於轉換公司債範圍、但讀不出證券代號（無法歸屬任何公告）的列數
+        self.index: Dict[str, List[Tuple[str, int, Any]]] = {}
+        try:
+            self.today = taipei_today(now)
+            asm = assess_sources(self.today, data_dir or default_data_dir())
+            if asm.state != "正常":
+                self.error = "；".join(asm.reasons_missing + asm.reasons_stale)[:300] or asm.state
+                return
+            parts = []
+            for yd in asm.years:
+                if not yd.ok:
+                    continue
+                ver = norm(yd.meta.get("file_version"))
+                last = asm.checks.get(yd.year, ("", None))[1]
+                parts.append(f"{yd.year}年檔 {'v' + ver if ver else '無版本號'} 最近成功檢查 {last if last else DASH}")
+                for idx, row in enumerate(yd.rows):
+                    fields = row.get("fields") if isinstance(row, dict) else None
+                    if not isinstance(fields, dict) or "案件類別" not in fields or "證券代號" not in fields:
+                        self.unreadable += 1
+                        continue
+                    if not norm(fields.get("案件類別")).startswith(CB_PREFIX):
+                        continue
+                    code = norm(fields.get("證券代號"))
+                    if not code:
+                        self.unreadable += 1
+                        continue
+                    self.index.setdefault(code, []).append((yd.year, idx, row))
+            self.version_txt = "、".join(parts)
+        except Exception as e:
+            self.error = f"讀取失敗（{type(e).__name__}）"
+
+    def lines_for(self, code: Any) -> List[str]:
+        try:
+            return self._lines_for(code)
+        except Exception as e:
+            return [f"{LOOKUP_HEAD}申報表資料缺失/過舊，未查詢（原因：查詢程式例外 {type(e).__name__}）"]
+
+    def _lines_for(self, code: Any) -> List[str]:
+        code = norm(code)
+        if not code or not CODE_RE.fullmatch(code):
+            return [f"{LOOKUP_HEAD}無法辨識證券代號，未查詢"]
+        if self.error:
+            return [f"{LOOKUP_HEAD}申報表資料缺失/過舊，未查詢（原因：{self.error}）"]
+        cands = self.index.get(code, [])
+        if not cands:
+            tail = f"；另有 {self.unreadable} 列無法解析的資料，結果可能不完整" if self.unreadable else ""
+            return [f"{LOOKUP_HEAD}查無此證券代號的轉換公司債申報案件（資料版本：{self.version_txt}；表為定期更新，查無不代表尚未送件）{tail}"]
+        cases: List[Case] = []
+        bad: List[str] = []
+        for year, idx, row in cands:
+            try:
+                c = classify_row(year, row, self.today)
+            except RowError as e:
+                xr = row.get("row") if isinstance(row, dict) else None
+                bad.append(f"  • 資料異常：{year}年檔 xlsx 第 {xr if xr is not None else '?'} 列 — {e}")
+                continue
+            except Exception as e:
+                bad.append(f"  • 資料異常：{year}年檔 陣列位置 {idx} — 解析例外 {type(e).__name__}")
+                continue
+            if c is not None:
+                cases.append(c)
+        same = collections.Counter((c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS)) for c in cases)
+        for c in cases:
+            c.same_n = same[(c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS))]
+        cases.sort(key=_recv_key)
+        rows_txt = [lookup_row_line(c) for c in cases] + bad
+        n = len(rows_txt)
+        ver = f"資料版本：{self.version_txt}"
+        # 行首固定註明「不判斷對應哪一次」。規格只要求同代號有多筆時加註；單筆也一律加註：
+        # 實例 7610 的公告是「第二次」無擔保可轉債董事會決議，表裡唯一一筆是第一次（已生效），單筆並不代表就是這則公告。
+        head = f"{LOOKUP_HEAD}{AMBIGUOUS_NOTE}（共 {n} 筆；{ver}"
+        if bad:
+            head += f"；其中資料異常 {len(bad)} 列"
+        head += "）"
+        out = [head] + rows_txt[:LOOKUP_MAX_ROWS]
+        if n > LOOKUP_MAX_ROWS:
+            out.append(f"  …另有 {n - LOOKUP_MAX_ROWS} 筆未列出")
+        return out
+
+
+def lookup_row_line(c: Case) -> str:
+    """一筆申報表列：類別簡稱｜金額(億)｜收文日期（送件）｜狀態｜對應日期。狀態只看結案類型，規則與申報進度區塊相同。"""
+    f = c.fields
+    if c.status == "reviewing":
+        if is_stop_effect(c):
+            status, when = "停止生效", f"停止生效日期 {fmt_date_cell(f.get('停止生效日期'))}｜生效日期（預定）{DASH}"
+        else:
+            status, when = "審理中", f"生效日期（預定）{fmt_date_cell(f.get('生效日期')) if c.get('生效日期') else DASH}"
+    elif c.status == "effective":
+        status, when = "已生效", f"生效日期 {fmt_date_cell(f.get('生效日期'))}"
+    else:
+        col = TERMINATION_COLUMNS[c.closing]
+        status, when = f"已終止（{c.closing}）", f"{col} {fmt_date_cell(f.get(col))}"
+    return (f"  • {short_category(c.category)}｜{fmt_amount(f)}｜收文日期（送件）{fmt_date_cell(f.get('收文日期'))}"
+            f"｜{status}｜{when}{dup_note(c)}")
