@@ -1,0 +1,47 @@
+name: 唯讀探測：證期局申報案件彙總表（手動、只讀、不發訊息）
+
+# 目的：確認 GitHub runner 能不能連上證期局頁面與 xlsx，並只回報「結構」：
+#   HTTP 狀態、大小、工作表、表頭、列數、日期欄樣態、案件類別／結案類型的值清單、超連結目標主機。
+# 不輸出公司名稱等內容，不寫入 repo，不使用任何 secrets，不碰 Telegram，不觸發其他 workflow。
+# 請求：頁面 1 次 + 115 年 xlsx 1 次 + 114 年 xlsx 1 次，間隔 ≥ 6 秒，不跟隨轉址，不重試。
+# xlsx 連結每次從頁面解析（檔名含版本，不硬編）。
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: "證期局頁面網址（留空用預設；主機須是 sfb.gov.tw / fsc.gov.tw）"
+        required: false
+        default: "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
+      dry_run:
+        description: "true = 只驗證設定、印出將送出的請求，不連線"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probe-fsc
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout（不保留 token）
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 🔎 探測（頁面 1 次 + 兩個 xlsx 各 1 次，間隔 ≥ 6 秒，不重試）
+        env:
+          PROBE_FSC_PAGE_URL: ${{ github.event.inputs.page_url }}
+          PROBE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          PROBE_REPO: ${{ github.repository }}
+        run: python3 scripts/probe_fsc.py
