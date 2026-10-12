@@ -162,12 +162,13 @@ class TestParsing(Base):
         self.assertEqual([t["row"] for t in meta["trailer_rows"]], [8, 9])
         self.assertEqual(meta["trailer_rows"][1]["cells"][0]["value"], "資料來源：證期局")
         self.assertNotIn("資料來源：證期局", json.dumps(self.parsed(), ensure_ascii=False))
-        self.assertIn("結尾非資料列 第 8 列：註：本表資料以申報當日為準。", self.run_archive(routes())[1])   # 同時記在 log
+        self.assertIn("結尾列（含文字）第 8 列：註：本表資料以申報當日為準。", self.run_archive(routes())[1])   # 同時記在 log
 
     def test_trailer_count_other_than_two_is_noticed_in_log(self):
         code, out, *_ = self.run_archive(routes(x115=xlsx(base_rows(), trailer=[["只有一列註記"]])))
         self.assertEqual(code, 0)
-        self.assertIn("結尾非資料列數為 1（先前確認為 2）", out)
+        self.assertIn("結尾列合計 1（含文字 1 + 全空 0；先前確認為 2）", out)
+        self.assertIn("提示，不是失敗", out)
 
     def test_multi_dates_become_arrays_and_raw_string_is_kept(self):
         rows = [data_row(code="1111", other_dates={"auto": "1150110,1150120", "stop": "1150201,1150202,1150203,1150204,1150205", "lift": "1150301"})]
@@ -227,7 +228,7 @@ class TestParsing(Base):
         rows = [data_row(code="1111", amount=100), data_row(code="1111", amount=150), data_row(code="2222", amount=7)]
         self.run_archive(routes(x115=xlsx(rows)))
         got = self.parsed()["rows"]
-        self.assertEqual([("疑似金額變更" in r["flags"]) for r in got], [True, True, False])
+        self.assertEqual([("同日同類別多筆" in r["flags"]) for r in got], [True, True, False])
         self.assertEqual({r["fields"]["金額"] for r in got[:2]}, {"100", "150"})      # 兩筆原值都在
 
     def test_amount_and_price_numeric_only_when_purely_numeric(self):
@@ -272,13 +273,48 @@ class TestParsing(Base):
     def test_last_row_with_only_a_code_and_one_cell_is_data_not_trailer(self):
         rows = base_rows() + [["7777", None, "審查中"] + [None] * 15]
         self.run_archive(routes(x115=xlsx(rows, trailer=[])))
-        self.assertEqual(self.load("meta/115.json")["row_counts"], {"sheet_rows": 8, "data_rows": 5, "trailer_rows": 0, "blank_rows": 0})
+        self.assertEqual(self.load("meta/115.json")["row_counts"], {"sheet_rows": 8, "data_rows": 5, "trailer_rows": 0, "trailing_blank_rows": 0, "blank_rows": 0})
         self.assertIn("7777", self.rows_by_code())
 
     def test_trailing_blank_rows_after_the_trailer_are_not_data(self):
         self.run_archive(routes(x115=xlsx(base_rows(), trailer=TRAILER + [[None], [None]])))
         rc = self.load("meta/115.json")["row_counts"]
-        self.assertEqual((rc["data_rows"], rc["trailer_rows"]), (4, 2))
+        self.assertEqual((rc["data_rows"], rc["trailer_rows"], rc["trailing_blank_rows"], rc["blank_rows"]), (4, 2, 2, 2))
+
+    def test_trailing_blank_rows_are_recorded_separately_from_text_trailer_rows(self):
+        # 與真實檔案同型：資料後 2 列「存在但沒有文字」（空字串／空白字元的儲存格）
+        code, out, *_ = self.run_archive(routes(x115=xlsx(base_rows(), trailer=[["", " "], [" "]])))
+        self.assertEqual(code, 0, out)
+        meta = self.load("meta/115.json")
+        self.assertEqual(meta["row_counts"], {"sheet_rows": 9, "data_rows": 4, "trailer_rows": 0, "trailing_blank_rows": 2, "blank_rows": 2})
+        self.assertEqual(meta["trailer_rows"], [])
+        self.assertIn("結尾列 2（含文字 0 + 全空 2）", out)
+        self.assertNotIn("先前確認為 2", out)                               # 合計恰為 2：不提示
+
+    def test_trailer_notice_uses_the_sum_and_is_never_a_failure(self):
+        code, out, *_ = self.run_archive(routes(x115=xlsx(base_rows(), trailer=[["說明文字"], [None], [" "], [" "]])))
+        self.assertEqual(code, 0, out)
+        rc = self.load("meta/115.json")["row_counts"]
+        self.assertEqual((rc["trailer_rows"], rc["trailing_blank_rows"]), (1, 3))
+        self.assertIn("結尾列合計 4（含文字 1 + 全空 3；先前確認為 2）", out)
+        self.assertEqual(self.run_archive(routes(x115=xlsx(base_rows(), trailer=[])), env={"ARCHIVE_FSC_DIR": self.tmp + "/n"})[0], 0)
+
+    def test_data_row_decisions_do_not_depend_on_trailing_blank_rows(self):
+        self.run_archive(routes(x115=xlsx(base_rows(), trailer=[])))
+        without = self.parsed()["rows"]
+        self.run_archive(routes(x115=xlsx(base_rows(), trailer=[["", " "], [" "]])), env={"ARCHIVE_FSC_DIR": self.tmp + "/w"})
+        with open(os.path.join(self.tmp, "w", "parsed", "115.json"), encoding="utf-8") as f:
+            with_blank = json.load(f)["rows"]
+        self.assertEqual(without, with_blank)
+
+    def test_neutral_flag_name_replaces_the_old_one_everywhere(self):
+        rows = [data_row(code="1111", amount=100), data_row(code="1111", amount=150)]
+        self.run_archive(routes(x115=xlsx(rows)))
+        text = open(os.path.join(self.dir, "parsed", "115.json"), encoding="utf-8").read()
+        self.assertIn("同日同類別多筆", text)
+        self.assertNotIn("疑似金額變更", text)
+        self.assertNotIn("疑似金額變更", open(self.summary, encoding="utf-8").read())
+        self.assertIn("同日同類別多筆×2", open(self.summary, encoding="utf-8").read())
 
     def test_wrong_sheet_name_with_good_header_is_a_warning_recorded_in_meta(self):
         code, out, *_ = self.run_archive(routes(x115=xlsx(base_rows(), sheet="Sheet1")))
@@ -346,7 +382,7 @@ class TestIdempotencyAndVersions(Base):
                 self.assertIn(b"2031-07-04", data)
             elif rel.startswith("parsed/"):
                 self.assertNotIn(b"2031-07-04", data)
-                self.assertNotIn(b"2031", data)
+                self.assertNotIn(b"2031-", data)           # 不用 b"2031"：sha256 十六進位字串偶爾會含這四個字元
 
     def test_first_seen_is_taipei_date_not_utc(self):
         self.run_archive(routes(), clock=datetime(2026, 10, 11, 17, 30, tzinfo=timezone.utc))       # UTC 17:30 = 台北隔天 01:30
@@ -389,6 +425,21 @@ class TestIdempotencyAndVersions(Base):
         d = [n for n in self.tree() if n.startswith("diffs/115_")][0]
         fields = {c["field"] for c in self.load(d)["changed"]}
         self.assertEqual(fields, {"自動補正日期", "停止生效日期", "解除生效日期", "生效日期", "廢止/撤銷日期", "自行撤回日期", "退件日期"})
+
+    def test_flag_rename_does_not_touch_diff_pairing_and_flags_never_appear_in_diffs(self):
+        rows = [data_row(code="1111", amount=100), data_row(code="1111", amount=150), data_row(code="2222", amount=7)]
+        self.run_archive(routes(x115=xlsx(rows)))
+        rows2 = [data_row(code="1111", amount=100), data_row(code="1111", amount=175), data_row(code="2222", amount=7)]
+        self.run_archive(routes(x115=xlsx(rows2)))
+        d = [n for n in self.tree() if n.startswith("diffs/115_")][0]
+        text = open(os.path.join(self.dir, d), encoding="utf-8").read()
+        diff = json.loads(text)
+        self.assertEqual((diff["vanished"], diff["added"], diff["changed"]), (["1111|現金增資|1150109|150#1"], ["1111|現金增資|1150109|175#1"], []))
+        self.assertNotIn("同日同類別多筆", text)
+        self.assertNotIn("flags", text)
+        # 旗標只是 parsed 的附註：兩個版本都有旗標，但 diff 的配對只看案件鍵與欄位值
+        flagged = [r for r in self.parsed()["rows"] if "同日同類別多筆" in r["flags"]]
+        self.assertEqual(len(flagged), 2)
 
     def test_only_changed_year_gets_a_diff_and_the_other_year_stays_identical(self):
         self.run_archive(routes())
@@ -771,6 +822,11 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertNotIn("git add .", run)
         self.assertNotRegex(run, r"(?m)^\s*git push\b")
         self.assertNotIn("reports", run)
+        # 原始檔入庫防呆：在 git add 之後、判斷「無變更」之前
+        self.assertIn("git ls-files --error-unmatch", run)
+        self.assertIn("::error title=原始檔未被 git 追蹤", run)
+        self.assertLess(run.index("git add data/fsc"), run.index("git ls-files --error-unmatch"))
+        self.assertLess(run.index("git ls-files --error-unmatch"), run.index("git diff --staged --quiet"))
 
     def test_failure_gate_and_continue_on_error(self):
         arch = [s for s in self.steps if s.get("id") == "archive"][0]
@@ -806,6 +862,8 @@ class TestCommitStepActuallyRuns(unittest.TestCase):
         self.git(self.work, "checkout", "-q", "-b", "master")
         os.makedirs(os.path.join(self.work, "scripts"))
         shutil.copy(os.path.join(ROOT, "scripts", "push_with_retry.sh"), os.path.join(self.work, "scripts"))
+        # 真實的 .gitignore（含 *.xlsx 與 data/fsc/raw 的例外）：首次部署就是死在這裡——暫存倉庫沒有它，測試看不出 raw 被忽略
+        shutil.copy(os.path.join(ROOT, ".gitignore"), os.path.join(self.work, ".gitignore"))
         with open(os.path.join(self.work, "README"), "w") as f:
             f.write("x")
         self.git(self.work, "add", "-A")
@@ -822,6 +880,9 @@ class TestCommitStepActuallyRuns(unittest.TestCase):
     def run_step(self):
         e = {**os.environ, "GITHUB_REF_NAME": "master", "PUSH_RETRY_SLEEP": "0", "PUSH_ATTEMPTS": "2", **self.env_extra}
         return self.subprocess.run(["bash", "-e", "-c", self.script], cwd=self.work, capture_output=True, text=True, env=e)
+
+    def remote_tree(self):
+        return self.git(self.tmp, "--git-dir", self.remote, "ls-tree", "-r", "--name-only", "master").stdout.split()
 
     def archive_into_work(self, rts):
         op = RoutedOpener(rts)
@@ -854,6 +915,67 @@ class TestCommitStepActuallyRuns(unittest.TestCase):
         r2 = self.run_step()
         self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
         self.assertIn("無變更", r2.stdout)
+
+    def test_every_path_the_archive_writes_is_not_ignored_by_the_real_gitignore(self):
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        # 讓 diffs/ 也出現：第二個版本
+        changed = base_rows()
+        changed[1][2] = "已生效"
+        self.assertEqual(self.archive_into_work(routes(x115=xlsx(changed))), 0)
+        os.makedirs(os.path.join(self.work, "data", "fsc"), exist_ok=True)
+        shutil.copy(os.path.join(ROOT, "data", "fsc", "SOURCE.md"), os.path.join(self.work, "data", "fsc", "SOURCE.md"))
+        paths = []
+        for r, _, fl in os.walk(os.path.join(self.work, "data", "fsc")):
+            paths += [os.path.relpath(os.path.join(r, f), self.work) for f in fl]
+        kinds = {p.split("/")[2] for p in paths}
+        self.assertEqual(kinds, {"raw", "parsed", "meta", "diffs", "SOURCE.md"})
+        for p in sorted(paths):
+            r = self.git(self.work, "check-ignore", "-v", p)
+            # 回傳 1 = 沒有任何規則命中；回傳 0 時 -v 會顯示命中的規則，開頭是 ! 的是「例外」規則（= 不被忽略）
+            if r.returncode == 0:
+                pattern = r.stdout.split("\t")[0].split(":", 2)[2]
+                self.assertTrue(pattern.startswith("!"), f"{p} 被忽略：{r.stdout}")
+            else:
+                self.assertEqual(r.returncode, 1, r.stderr)
+
+    def test_the_test_is_meaningful_without_the_exception_raw_would_be_ignored(self):
+        with open(os.path.join(self.work, ".gitignore"), "w") as f:
+            f.write("*.xlsx\n")                                              # 修正前的規則
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        raw = [os.path.relpath(os.path.join(r, f), self.work) for r, _, fl in os.walk(os.path.join(self.work, "data", "fsc", "raw")) for f in fl]
+        self.assertEqual(len(raw), 2)
+        for p in raw:
+            self.assertEqual(self.git(self.work, "check-ignore", "-q", p).returncode, 0, p)
+
+    def test_raw_files_are_committed_and_pushed_with_the_real_gitignore(self):
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        r = self.run_step()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        tree = self.remote_tree()
+        self.assertEqual(len([n for n in tree if n.startswith("data/fsc/raw/") and n.endswith(".xlsx")]), 2, tree)
+
+    def test_raw_present_but_ignored_turns_the_run_red_and_pushes_nothing(self):
+        with open(os.path.join(self.work, ".gitignore"), "w") as f:
+            f.write("*.xlsx\n")                                              # 修正前的 .gitignore
+        self.git(self.work, "add", ".gitignore")
+        self.git(self.work, "commit", "-q", "-m", "old ignore")
+        self.git(self.work, "push", "-q", "origin", "master")
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        r = self.run_step()
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("::error title=原始檔未被 git 追蹤", r.stdout)
+        self.assertEqual(r.stdout.count("::error title=原始檔未被 git 追蹤"), 2)    # 兩個年度的原檔各一次
+        self.assertEqual([n for n in self.remote_tree() if n.startswith("data/")], [])          # 半套資料（只有 meta／parsed）也不提交
+        self.assertNotIn("push 成功", r.stdout)
+
+    def test_a_single_ignored_raw_file_is_enough_to_fail(self):
+        self.assertEqual(self.archive_into_work(routes()), 0)
+        with open(os.path.join(self.work, "data", "fsc", "raw", "evil.csv"), "w") as f:
+            f.write("x")                                                    # *.csv 同樣被 .gitignore 忽略
+        r = self.run_step()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("raw/evil.csv", r.stdout)
+        self.assertEqual([n for n in self.remote_tree() if n.startswith("data/")], [])
 
     def test_push_failure_turns_the_step_red_with_the_fsc_specific_message(self):
         self.assertEqual(self.archive_into_work(routes()), 0)
