@@ -31,18 +31,20 @@
    }
   },
   "20261012": {
-   "filtered": 4,
+   "filtered": 7,
    "filtered_by_source": {
+    "tpex": 3,
     "twse": 4
    },
    "keywords_in_filtered": {
     "申報生效": 0,
     "競價拍賣": 0,
-    "董事會": 3,
+    "董事會": 4,
     "送件": 0
    },
-   "total": 102,
+   "total": 152,
    "total_by_source": {
+    "tpex": 50,
     "twse": 102
    }
   }
