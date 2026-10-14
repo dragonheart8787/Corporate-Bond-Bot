@@ -19,11 +19,11 @@
   "退件日期",
   "案件性質"
  ],
- "file_version": "1",
- "filename_decoded": "1151013申報v1.xlsx",
- "filename_original": "1151013%E7%94%B3%E5%A0%B1v1.xlsx",
- "filename_safe": "1151013申報v1.xlsx",
- "first_seen": "2026-10-13",
+ "file_version": "3",
+ "filename_decoded": "1151014申報v3.xlsx",
+ "filename_original": "1151014%E7%94%B3%E5%A0%B1v3.xlsx",
+ "filename_safe": "1151014申報v3.xlsx",
+ "first_seen": "2026-10-14",
  "header_row": 3,
  "history": [
   {
@@ -46,25 +46,32 @@
    "sha256": "8451bc74842d7c0a1755045736c16d5392c21f6be55a96ef753a243fcacd7715",
    "sha8": "8451bc74",
    "size": 70551
+  },
+  {
+   "filename": "1151014申報v3.xlsx",
+   "first_seen": "2026-10-14",
+   "sha256": "a004f43f5aaf1146c8078cc92baa424c90daed267bda4b2e070fe7e0729a8b36",
+   "sha8": "a004f43f",
+   "size": 71826
   }
  ],
  "link_text": "EXCEL",
- "page_update_text": "2026-10-13",
- "reference_date": "2026-10-13",
+ "page_update_text": "2026-10-14",
+ "reference_date": "2026-10-14",
  "row_counts": {
   "blank_rows": 2,
-  "data_rows": 661,
-  "sheet_rows": 666,
+  "data_rows": 668,
+  "sheet_rows": 673,
   "trailer_rows": 0,
   "trailing_blank_rows": 2
  },
- "sha256": "8451bc74842d7c0a1755045736c16d5392c21f6be55a96ef753a243fcacd7715",
+ "sha256": "a004f43f5aaf1146c8078cc92baa424c90daed267bda4b2e070fe7e0729a8b36",
  "sheet_name": "IMP0080A_Upload",
- "size": 70551,
- "source_date_filename": "2026-10-13",
- "source_date_page": "2026-10-13",
+ "size": 71826,
+ "source_date_filename": "2026-10-14",
+ "source_date_page": "2026-10-14",
  "source_page": "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52",
- "source_url": "https://www.fsc.gov.tw/userfiles/file/1151013%E7%94%B3%E5%A0%B1v1.xlsx",
+ "source_url": "https://www.fsc.gov.tw/userfiles/file/1151014%E7%94%B3%E5%A0%B1v3.xlsx",
  "trailer_rows": [],
  "version": 1,
  "year": "115",
