@@ -1,0 +1,18 @@
+{
+ "added": [
+  "2883|現金增資|1151014|7200000000#1"
+ ],
+ "changed": [],
+ "counts": {
+  "added": 1,
+  "changed_fields": 0,
+  "new_rows": 669,
+  "old_rows": 668,
+  "vanished": 0
+ },
+ "new_sha256": "e4ebdb718c0d701ebcfd3d2d58e8958ab66b4d97ec7b28607d8ae7ba97144ea2",
+ "old_sha256": "a004f43f5aaf1146c8078cc92baa424c90daed267bda4b2e070fe7e0729a8b36",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
