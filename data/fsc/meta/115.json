@@ -19,11 +19,11 @@
   "退件日期",
   "案件性質"
  ],
- "file_version": "2",
- "filename_decoded": "1151019申報v2.xlsx",
- "filename_original": "1151019%E7%94%B3%E5%A0%B1v2.xlsx",
- "filename_safe": "1151019申報v2.xlsx",
- "first_seen": "2026-10-19",
+ "file_version": "",
+ "filename_decoded": "1151020申報案件彙總表1.xlsx",
+ "filename_original": "1151020%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A81.xlsx",
+ "filename_safe": "1151020申報案件彙總表1.xlsx",
+ "first_seen": "2026-10-20",
  "header_row": 3,
  "history": [
   {
@@ -74,25 +74,32 @@
    "sha256": "567cc12631a656d09de2df6b66886760a902e3bf4addeec9a1a986d99eba952f",
    "sha8": "567cc126",
    "size": 72038
+  },
+  {
+   "filename": "1151020申報案件彙總表1.xlsx",
+   "first_seen": "2026-10-20",
+   "sha256": "0ea539623368182efa988b01bdc86bf61c64ba6c9538611f4d1c08c0b4305326",
+   "sha8": "0ea53962",
+   "size": 72257
   }
  ],
  "link_text": "EXCEL",
- "page_update_text": "2026-10-19",
- "reference_date": "2026-10-19",
+ "page_update_text": "2026-10-20",
+ "reference_date": "2026-10-20",
  "row_counts": {
-  "blank_rows": 2,
-  "data_rows": 679,
-  "sheet_rows": 684,
+  "blank_rows": 1,
+  "data_rows": 682,
+  "sheet_rows": 686,
   "trailer_rows": 0,
-  "trailing_blank_rows": 2
+  "trailing_blank_rows": 1
  },
- "sha256": "567cc12631a656d09de2df6b66886760a902e3bf4addeec9a1a986d99eba952f",
+ "sha256": "0ea539623368182efa988b01bdc86bf61c64ba6c9538611f4d1c08c0b4305326",
  "sheet_name": "IMP0080A_Upload",
- "size": 72038,
- "source_date_filename": "2026-10-19",
- "source_date_page": "2026-10-19",
+ "size": 72257,
+ "source_date_filename": "2026-10-20",
+ "source_date_page": "2026-10-20",
  "source_page": "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52",
- "source_url": "https://www.fsc.gov.tw/userfiles/file/1151019%E7%94%B3%E5%A0%B1v2.xlsx",
+ "source_url": "https://www.fsc.gov.tw/userfiles/file/1151020%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A81.xlsx",
  "trailer_rows": [],
  "version": 1,
  "year": "115",
