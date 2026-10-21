@@ -168,6 +168,24 @@
     "tpex": 59,
     "twse": 53
    }
+  },
+  "20261020": {
+   "filtered": 16,
+   "filtered_by_source": {
+    "tpex": 5,
+    "twse": 11
+   },
+   "keywords_in_filtered": {
+    "申報生效": 2,
+    "競價拍賣": 0,
+    "董事會": 8,
+    "送件": 0
+   },
+   "total": 142,
+   "total_by_source": {
+    "tpex": 30,
+    "twse": 112
+   }
   }
  },
  "version": 1
