@@ -322,6 +322,24 @@
     "tpex": 70,
     "twse": 160
    }
+  },
+  "20261029": {
+   "filtered": 10,
+   "filtered_by_source": {
+    "tpex": 3,
+    "twse": 7
+   },
+   "keywords_in_filtered": {
+    "申報生效": 3,
+    "競價拍賣": 1,
+    "董事會": 6,
+    "送件": 1
+   },
+   "total": 256,
+   "total_by_source": {
+    "tpex": 74,
+    "twse": 182
+   }
   }
  },
  "version": 1
