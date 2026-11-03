@@ -390,8 +390,9 @@
    }
   },
   "20261102": {
-   "filtered": 7,
+   "filtered": 9,
    "filtered_by_source": {
+    "tpex": 2,
     "twse": 7
    },
    "keywords_in_filtered": {
@@ -400,8 +401,9 @@
     "董事會": 3,
     "送件": 0
    },
-   "total": 92,
+   "total": 156,
    "total_by_source": {
+    "tpex": 64,
     "twse": 92
    }
   }
