@@ -509,18 +509,20 @@
    }
   },
   "20261109": {
-   "filtered": 16,
+   "filtered": 27,
    "filtered_by_source": {
+    "tpex": 11,
     "twse": 16
    },
    "keywords_in_filtered": {
-    "申報生效": 2,
-    "競價拍賣": 0,
-    "董事會": 8,
+    "申報生效": 4,
+    "競價拍賣": 1,
+    "董事會": 17,
     "送件": 0
    },
-   "total": 371,
+   "total": 578,
    "total_by_source": {
+    "tpex": 207,
     "twse": 371
    }
   }
