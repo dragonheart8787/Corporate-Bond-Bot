@@ -735,7 +735,7 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertIs(co["with"]["persist-credentials"], False)
         run = [s for s in steps if "probe_fsc.py" in s.get("run", "")][0]
         self.assertNotIn("${{", run["run"])
-        self.assertEqual(set(run["env"]), {"PROBE_FSC_PAGE_URL", "PROBE_DRY_RUN", "PROBE_REPO"})
+        self.assertEqual(set(run["env"]), {"PROBE_FSC_PAGE_URL", "PROBE_MODE", "PROBE_DRY_RUN", "PROBE_REPO"})
 
     def test_default_page_url_matches_script_and_is_allowlisted(self):
         d = self.wf[True]["workflow_dispatch"]["inputs"]["page_url"]["default"]
