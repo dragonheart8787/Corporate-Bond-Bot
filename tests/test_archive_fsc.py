@@ -767,11 +767,11 @@ class TestFailClosed(Base):
     def test_unexpected_exception_in_one_year_is_an_error_not_a_crash(self):
         orig = af.parse_sheet
 
-        def boom(data):
+        def boom(data, *a):
             if boom.n == 0:
                 boom.n += 1
                 raise RuntimeError("boom")
-            return orig(data)
+            return orig(data, *a)
         boom.n = 0
         af.parse_sheet = boom
         try:

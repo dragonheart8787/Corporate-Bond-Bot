@@ -59,6 +59,9 @@ def make_xlsx(sheets, *, doctype=False, extra_members=None):
                 ref = f"{col_letter(ci)}{ri}"
                 if v is None:
                     continue
+                if isinstance(v, tuple) and v[0] == "num":       # ("num", 原樣文字)：數字型儲存格，<v> 逐字照寫（模擬 Excel 寫入的數字文字）
+                    cells.append(f'<c r="{ref}"><v>{v[1]}</v></c>')
+                    continue
                 if isinstance(v, tuple):
                     kind, text, target = v
                     if kind == "link":
@@ -735,7 +738,7 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertIs(co["with"]["persist-credentials"], False)
         run = [s for s in steps if "probe_fsc.py" in s.get("run", "")][0]
         self.assertNotIn("${{", run["run"])
-        self.assertEqual(set(run["env"]), {"PROBE_FSC_PAGE_URL", "PROBE_DRY_RUN", "PROBE_REPO"})
+        self.assertEqual(set(run["env"]), {"PROBE_FSC_PAGE_URL", "PROBE_MODE", "PROBE_DRY_RUN", "PROBE_REPO"})
 
     def test_default_page_url_matches_script_and_is_allowlisted(self):
         d = self.wf[True]["workflow_dispatch"]["inputs"]["page_url"]["default"]
