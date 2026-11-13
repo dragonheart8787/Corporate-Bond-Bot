@@ -15,7 +15,12 @@ archive-fsc 失敗／恢復通知（只用標準函式庫）。由 archive-fsc.y
 訊息只含：workflow 名稱、run 連結、失敗年度與失敗類別、各年度最後成功檢查日、連續失敗次數。
 不含公司名稱、金額、token、chat id（失敗類別取自既有 ::error:: 的分類，不轉貼 ::error:: 原文）。
 
-測試開關 ALERT_TEST=1：只把訊息內容印到 log，絕不送出（沒有任何會真實發送的測試模式）。ARCHIVE_DRY_RUN=1：不通知。
+測試開關 ALERT_TEST=1：只把訊息內容印到 log，絕不送出。ARCHIVE_DRY_RUN=1：不通知。
+
+管道測試 SEND_TEST=1（workflow 的 send_test 輸入，唯一會真實送出的測試）：只送一則固定的測試訊息（PIPE_TEST_MESSAGE + run 連結），
+不抓取、不查詢前幾次 run、不提交、不寫檔。只有 ALERT_EVENT_NAME == workflow_dispatch、且 ARCHIVE_DRY_RUN != 1、ALERT_TEST != 1 才會送（workflow 條件之外的第二道檢查）；
+送訊沿用 bot_relay.send_telegram_alert（同一組 secrets）。與一般通知相反：任何失敗都是 ::error:: 並 exit 1（讓 run 變紅），不吞例外。
+log 只印 HTTP 狀態碼與 Telegram 回傳的 error_code／description（遮罩 token、chat id 後截短），不印完整回應。
 
 環境變數：
   ARCHIVE_OUTCOME / COMMIT_OUTCOME  抓取並存檔、提交存檔兩個步驟的 outcome（success|failure|skipped|cancelled）
@@ -41,6 +46,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPEAT_EVERY = 6                 # 連續失敗每 6 次重發（6、12、18…）
 DRY_RUN_MARK = "dry-run"         # archive-fsc.yml 的 run-name 在 dry_run 時帶「（dry-run）」
+SEND_TEST_MARK = "管道測試"       # run-name 在 send_test 時帶「（管道測試）」：這類 run 不是成功也不是失敗，不計入連續失敗判斷
+PIPE_TEST_MESSAGE = "【管道測試】archive-fsc 通知管道測試（非真實失敗）"      # 固定的一行；不帶任何資料、年度、日期、次數或公司資訊
+DESC_MAX = 120                   # Telegram 回傳的 description 最多印這麼長
 PER_PAGE = 100
 MAX_PAGES = 5                    # 最多回溯 500 次 run（每天 2 班約 8 個月）
 API_TIMEOUT = 20
@@ -144,11 +152,11 @@ def decide(current_failed: bool, history: Optional[List[str]]) -> Decision:
 # 查詢前幾次 run
 # ─────────────────────────────────────────
 def conclusion_of(run: Dict[str, Any]) -> Optional[str]:
-    """已完成 run 的結論：success | failure；取消、略過、dry_run、進行中 → None（不計入）。"""
+    """已完成 run 的結論：success | failure；取消、略過、dry_run、管道測試、進行中 → None（不計入）。"""
     if run.get("status") != "completed":
         return None
     title = " ".join(str(run.get(k) or "") for k in ("display_title", "name"))
-    if DRY_RUN_MARK in title:
+    if DRY_RUN_MARK in title or SEND_TEST_MARK in title:
         return None
     c = run.get("conclusion")
     if c in SUCCESS_CONCLUSIONS:
@@ -273,11 +281,141 @@ def sample_messages(env: Dict[str, str]) -> Tuple[str, str]:
 
 
 # ─────────────────────────────────────────
+# 管道測試（真實送出一則固定訊息；任何失敗都 exit 1）
+# ─────────────────────────────────────────
+_TOKEN_LIKE = re.compile(r"\d{5,}:[A-Za-z0-9_-]{20,}")
+_BIG_NUMBER = re.compile(r"-?\d{8,}")
+
+
+def sanitize_description(text: Any, secrets: Tuple[str, ...]) -> str:
+    """Telegram 回傳的 description（例如「Bad Request: chat not found」）→ 可安全印出的短字串：遮罩 token／chat id、截短、只留可見字元。"""
+    t = "".join(ch for ch in str(text) if ch.isprintable())
+    for sec in secrets:
+        if sec and len(sec) >= 4:
+            t = t.replace(sec, "***")
+    t = _TOKEN_LIKE.sub("***", t)
+    t = _BIG_NUMBER.sub("***", t)
+    return t[:DESC_MAX]
+
+
+class _Done:
+    """send_telegram_alert 需要的最小回應物件（with、.status）。"""
+
+    def __init__(self, status: int):
+        self.status = status
+
+    def __enter__(self) -> "_Done":
+        return self
+
+    def __exit__(self, *a: Any) -> bool:
+        return False
+
+
+class TelegramCapture:
+    """
+    包住 urlopen：讓 bot_relay.send_telegram_alert 照常送出，同時留下診斷資訊（HTTP 狀態碼、error_code、description、例外類別）。
+    只保存這幾個欄位，不保存請求（含 token 的網址）與完整回應。
+    """
+
+    def __init__(self, opener: Callable[..., Any], secrets: Tuple[str, ...]):
+        self.opener, self.secrets = opener, secrets
+        self.http: Optional[int] = None
+        self.error_code: Optional[int] = None
+        self.description: str = ""
+        self.exc: str = ""
+
+    def _parse(self, body: bytes) -> Optional[bool]:
+        try:
+            obj = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if isinstance(obj.get("error_code"), int):
+            self.error_code = obj["error_code"]
+        if isinstance(obj.get("description"), str):
+            self.description = sanitize_description(obj["description"], self.secrets)
+        ok = obj.get("ok")
+        return ok if isinstance(ok, bool) else None
+
+    def __call__(self, req: Any, timeout: Any = None) -> _Done:
+        try:
+            with self.opener(req, timeout=timeout) as resp:
+                self.http = int(resp.status)
+                body = resp.read(65536)
+        except urllib.error.HTTPError as e:
+            self.http = int(e.code)
+            try:
+                self._parse(e.read(65536))
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            self.exc = type(e).__name__
+            raise
+        if 200 <= (self.http or 0) < 300 and self._parse(body) is False:
+            raise OSError("Telegram 回應 ok=false")        # 2xx 但 API 說失敗：當作失敗（send_telegram_alert 會捕捉並回 False）
+        return _Done(self.http or 0)
+
+    def reason(self) -> str:
+        parts: List[str] = []
+        if self.http is not None:
+            parts.append(f"HTTP {self.http}")
+        if self.error_code is not None:
+            parts.append(f"Telegram error_code={self.error_code}")
+        if self.description:
+            parts.append(f"description={self.description}")
+        if self.exc:
+            parts.append(f"例外類別={self.exc}（逾時或連線失敗）")
+        return "｜".join(parts) or "沒有取得回應"
+
+
+def pipe_test_message(env: Dict[str, str]) -> str:
+    return f"{PIPE_TEST_MESSAGE}\nrun：{run_url(env)}"
+
+
+def run_pipe_test(env: Dict[str, str], telegram_opener: Callable[..., Any] = urllib.request.urlopen) -> int:
+    """成功 0；任何不合法、缺 secret、送出失敗 → ::error:: 與 1。絕不吞例外。"""
+    def fail(title: str, why: str) -> int:
+        log(f"::error title=管道測試失敗 {title}::{why}")
+        return 1
+
+    # 第二道檢查（第一道是 workflow 的 validate 步驟與 if 條件）：只有手動 dispatch、且不與 dry_run／test_alert 並用才可能送
+    if env.get("ALERT_EVENT_NAME", "") != "workflow_dispatch":
+        return fail("觸發方式不合法", "管道測試只能由手動 dispatch 觸發；沒有送出任何訊息")
+    if env.get("ARCHIVE_DRY_RUN", "") == "1" or env.get("ALERT_TEST", "") == "1":
+        return fail("輸入不合法", "send_test 不可與 dry_run 或 test_alert 並用；沒有送出任何訊息")
+    token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat = (env.get("BOT_ALERT_CHAT_ID") or "").strip()
+    missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", token), ("TELEGRAM_CHAT_ID", chat)) if not v]
+    if missing:
+        return fail("secrets 缺失", f"{'、'.join(missing)} 缺失或為空（repo secrets 未設定，或名稱不符）；沒有送出任何訊息")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import bot_relay                                       # 既有的送訊能力與同一組 secrets，不另寫送訊程式
+    cap = TelegramCapture(telegram_opener, (token, chat))
+    try:
+        ok = bool(bot_relay.send_telegram_alert(pipe_test_message(env), {"TELEGRAM_BOT_TOKEN": token, "BOT_ALERT_CHAT_ID": chat}, opener=cap))
+    except Exception as e:
+        return fail("送出時發生例外", f"{type(e).__name__}（{cap.reason()}）")
+    if not ok:
+        return fail("Telegram 沒有接受訊息", cap.reason())
+    log("✅ 管道測試訊息已送出")
+    return 0
+
+
+# ─────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────
 def main(env: Optional[Dict[str, str]] = None, *, opener: Callable[..., Any] = urllib.request.urlopen,
-         send: Optional[Callable[[str], bool]] = None) -> int:
+         send: Optional[Callable[[str], bool]] = None, telegram_opener: Callable[..., Any] = urllib.request.urlopen) -> int:
     env = dict(os.environ if env is None else env)
+    if env.get("SEND_TEST", "") == "1":
+        # 管道測試：與一般通知完全分開——不查詢前幾次 run、不讀檔、不寫檔；失敗不被吞掉（exit 1）
+        try:
+            return run_pipe_test(env, telegram_opener)
+        except Exception as e:
+            log(f"::error title=管道測試失敗 程式例外::{type(e).__name__}")
+            return 1
     try:
         return _main(env, opener, send)
     except Exception as e:  # 通知本身出任何事都不能改變原本的結果
