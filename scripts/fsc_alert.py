@@ -18,7 +18,7 @@ archive-fsc 失敗／恢復通知（只用標準函式庫）。由 archive-fsc.y
 測試開關 ALERT_TEST=1：只把訊息內容印到 log，絕不送出。ARCHIVE_DRY_RUN=1：不通知。
 
 管道測試 SEND_TEST=1（workflow 的 send_test 輸入，唯一會真實送出的測試）：只送一則固定的測試訊息（PIPE_TEST_MESSAGE + run 連結），
-不抓取、不查詢前幾次 run、不提交、不寫檔。只有 ALERT_EVENT_NAME == workflow_dispatch、且 ARCHIVE_DRY_RUN != 1、ALERT_TEST != 1 才會送（workflow 條件之外的第二道檢查）；
+不抓取、不查詢前幾次 run、不提交、不寫檔。只有 ALERT_EVENT_NAME == workflow_dispatch、ALERT_REF == refs/heads/master、且 ARCHIVE_DRY_RUN != 1、ALERT_TEST != 1 才會送（workflow 條件之外的第二道檢查）；
 送訊沿用 bot_relay.send_telegram_alert（同一組 secrets）。與一般通知相反：任何失敗都是 ::error:: 並 exit 1（讓 run 變紅），不吞例外。
 log 只印 HTTP 狀態碼與 Telegram 回傳的 error_code／description（遮罩 token、chat id 後截短），不印完整回應。
 
@@ -383,6 +383,8 @@ def run_pipe_test(env: Dict[str, str], telegram_opener: Callable[..., Any] = url
     # 第二道檢查（第一道是 workflow 的 validate 步驟與 if 條件）：只有手動 dispatch、且不與 dry_run／test_alert 並用才可能送
     if env.get("ALERT_EVENT_NAME", "") != "workflow_dispatch":
         return fail("觸發方式不合法", "管道測試只能由手動 dispatch 觸發；沒有送出任何訊息")
+    if env.get("ALERT_REF", "") != "refs/heads/master":
+        return fail("分支不合法", "管道測試只能在 master 分支上執行；沒有送出任何訊息")
     if env.get("ARCHIVE_DRY_RUN", "") == "1" or env.get("ALERT_TEST", "") == "1":
         return fail("輸入不合法", "send_test 不可與 dry_run 或 test_alert 並用；沒有送出任何訊息")
     token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()

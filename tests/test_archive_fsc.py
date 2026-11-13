@@ -968,9 +968,10 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertEqual(n["continue-on-error"], "${{ github.event.inputs.send_test != 'true' }}")
         env = n["env"]
         self.assertEqual(set(env), {"TELEGRAM_BOT_TOKEN", "BOT_ALERT_CHAT_ID", "GH_API_TOKEN", "ARCHIVE_OUTCOME", "COMMIT_OUTCOME", "ARCHIVE_LOG",
-                                    "ARCHIVE_DRY_RUN", "ALERT_TEST", "ALERT_WORKFLOW_FILE", "ALERT_EVENT_NAME", "SEND_TEST"})
+                                    "ARCHIVE_DRY_RUN", "ALERT_TEST", "ALERT_WORKFLOW_FILE", "ALERT_EVENT_NAME", "ALERT_REF", "SEND_TEST"})
+        self.assertEqual(env["ALERT_REF"], "${{ github.ref }}")
         self.assertEqual(env["ALERT_EVENT_NAME"], "${{ github.event_name }}")
-        self.assertEqual(env["SEND_TEST"], "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.send_test == 'true' && '1' || '0' }}")
+        self.assertEqual(env["SEND_TEST"], "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && github.event.inputs.send_test == 'true' && '1' || '0' }}")
         # test_alert=true 時 secrets 被換成空字串（不能用 `cond && '' || secret`：空字串是 falsy，會誤取 secret）
         for name, secret in (("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"), ("BOT_ALERT_CHAT_ID", "TELEGRAM_CHAT_ID")):
             self.assertEqual(env[name], "${{ github.event.inputs.test_alert != 'true' && secrets.%s || '' }}" % secret)
@@ -985,6 +986,10 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertEqual(set(self.wf[True]["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert", "send_test"})
         self.assertEqual(set(self.wf[True]), {"schedule", "workflow_dispatch"})
         self.assertIn("github.event_name == 'workflow_dispatch'", self.notify_step()["env"]["SEND_TEST"])
+        self.assertIn("github.ref == 'refs/heads/master'", self.notify_step()["env"]["SEND_TEST"])          # 雙重檢查之一
+        validate = [s for s in self.steps if s.get("id") == "validate"][0]
+        self.assertEqual(validate["env"]["REF"], "${{ github.ref }}")
+        self.assertIn('[ "$REF" != "refs/heads/master" ]', validate["run"])                                  # 雙重檢查之二
 
     def test_step_order_and_run_name_marker(self):
         ids = [s.get("id") for s in self.steps]

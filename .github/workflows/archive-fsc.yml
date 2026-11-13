@@ -14,7 +14,7 @@ run-name: 留存證期局申報案件彙總表${{ github.event.inputs.dry_run ==
 #   dry_run 不通知；test_alert=true 只把訊息印到 log、不送出。通知失敗只寫 ::warning::，不影響失敗閘門。
 # 管道測試：send_test=true（只能手動 dispatch，且 dry_run=false、test_alert=false）是唯一會「真實送出一則固定測試訊息」的入口：
 #   不抓取、不查詢前幾次 run、不提交、不寫檔；送訊失敗（HTTP 非 2xx、secret 缺失、chat id 錯誤、逾時）會讓 run 變紅。
-#   不合法的組合在最早的步驟（任何網路請求之前）就 ::error:: 並失敗。schedule 等其他觸發不可能進入送訊。
+#   不合法的組合在最早的步驟（任何網路請求之前）就 ::error:: 並失敗；只能在 master 分支上執行。schedule 等其他觸發不可能進入送訊。
 # 資料使用條款見 data/fsc/SOURCE.md（引用須註明來源、不得任意增刪、不得商業使用）。
 on:
   schedule:
@@ -62,17 +62,18 @@ jobs:
 
     steps:
       # 最早的步驟（早於 checkout 與任何網路請求）：send_test 只能單獨使用。違反就失敗，後面的步驟（含通知）都不會執行。
-      - name: 🧪 輸入檢查（send_test 不可與 dry_run、test_alert 並用，且只能手動 dispatch）
+      - name: 🧪 輸入檢查（send_test 不可與 dry_run、test_alert 並用，只能手動 dispatch，且只能在 master 上）
         id: validate
         env:
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           TEST_ALERT: ${{ github.event.inputs.test_alert }}
           SEND_TEST: ${{ github.event.inputs.send_test }}
         run: |
           if [ "$SEND_TEST" = "true" ]; then
-            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$DRY_RUN" = "true" ] || [ "$TEST_ALERT" = "true" ]; then
-              echo "::error title=send_test 輸入不合法::send_test=true 只能手動 dispatch，且必須搭配 dry_run=false 與 test_alert=false。沒有抓取、沒有送出任何訊息。"
+            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$REF" != "refs/heads/master" ] || [ "$DRY_RUN" = "true" ] || [ "$TEST_ALERT" = "true" ]; then
+              echo "::error title=send_test 輸入不合法::send_test=true 只能手動 dispatch、只能在 master 分支上執行，且必須搭配 dry_run=false 與 test_alert=false。沒有抓取、沒有送出任何訊息。"
               exit 1
             fi
           fi
@@ -147,7 +148,8 @@ jobs:
           ALERT_TEST: ${{ github.event.inputs.test_alert == 'true' && '1' || '0' }}
           ALERT_WORKFLOW_FILE: archive-fsc.yml
           ALERT_EVENT_NAME: ${{ github.event_name }}
-          SEND_TEST: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.send_test == 'true' && '1' || '0' }}
+          ALERT_REF: ${{ github.ref }}
+          SEND_TEST: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && github.event.inputs.send_test == 'true' && '1' || '0' }}
         run: python3 scripts/fsc_alert.py
 
       - name: 🚦 失敗閘門（抓取有任何失敗就讓 run 變紅）

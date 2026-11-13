@@ -50,8 +50,8 @@ WF = os.path.join(ROOT, ".github", "workflows", "archive-fsc.yml")
 # workflow 條件模擬（把 if／env／run-name 的 ${{ }} 表達式翻成 Python 求值；validate 步驟用真的 bash 執行）
 # ─────────────────────────────────────────
 class Ctx:
-    def __init__(self, event_name, inputs, outcomes=None, job_ok=True):
-        self.event_name, self.inputs, self.outcomes, self.job_ok = event_name, dict(inputs), dict(outcomes or {}), job_ok
+    def __init__(self, event_name, inputs, outcomes=None, job_ok=True, ref="refs/heads/master"):
+        self.event_name, self.inputs, self.outcomes, self.job_ok, self.ref = event_name, dict(inputs), dict(outcomes or {}), job_ok, ref
 
     def secrets(self, name):
         return {"TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT}.get(name, "")
@@ -62,6 +62,7 @@ def ev_expr(expr, ctx):
     e = e.replace("!=", " __NE__ ")
     e = re.sub(r"github\.event\.inputs\.(\w+)", lambda m: f"ctx.inputs.get('{m.group(1)}', '')", e)
     e = e.replace("github.event_name", "ctx.event_name")
+    e = re.sub(r"github\.ref\b(?!_)", "ctx.ref", e)
     e = re.sub(r"steps\.(\w+)\.outcome", lambda m: f"ctx.outcomes.get('{m.group(1)}', 'skipped')", e)
     e = re.sub(r"secrets\.(\w+)", lambda m: f"ctx.secrets('{m.group(1)}')", e)
     e = e.replace("github.token", "'ghs-token'").replace("runner.temp", "'/tmp'").replace("github.repository", "'o/r'")
@@ -98,10 +99,10 @@ class WorkflowSim(unittest.TestCase):
     def sid(self, s):
         return s.get("id") or ("checkout" if "uses" in s else "gate" if "失敗閘門" in s["name"] else s["name"])
 
-    def simulate(self, event, inputs, results=None):
+    def simulate(self, event, inputs, results=None, ref="refs/heads/master"):
         """回傳 {步驟 id: ran}、{步驟 id: outcome}、ctx。results：步驟 id → 'failure' 以覆寫預設的成功。"""
         results = results or {}
-        ctx = Ctx(event, inputs)
+        ctx = Ctx(event, inputs, ref=ref)
         ran, outcome = {}, {}
         for st in self.steps:
             i = self.sid(st)
@@ -171,6 +172,29 @@ class TestSendTestWorkflowBehaviour(WorkflowSim):
         self.assertEqual([i for i, r in ran.items() if r], ["validate"])
         # 就算 validate 被繞過，SEND_TEST 的 env 表達式對 schedule 也一定是 '0'
         env = {k: render(v, Ctx("schedule", {"send_test": "true"})) for k, v in self.notify()["env"].items()}
+        self.assertEqual(env["SEND_TEST"], "0")
+
+    def test_send_test_on_a_non_master_ref_fails_in_validate_and_never_sends(self):
+        legal = {"dry_run": "false", "test_alert": "false", "send_test": "true"}
+        for ref in ("refs/heads/claude/archive-fsc-send-test", "refs/heads/main", "refs/heads/master2", "refs/tags/master", "refs/pull/1/merge", ""):
+            with self.subTest(ref=ref):
+                ran, out, ctx = self.simulate("workflow_dispatch", legal, ref=ref)
+                self.assertEqual(out["validate"], "failure")
+                self.assertIn("只能在 master 分支上執行", self.last_validate_out)
+                self.assertEqual([i for i, r in ran.items() if r], ["validate"])             # checkout、抓取、通知（含送訊）都不執行
+                self.assertFalse(ctx.job_ok)
+                # 雙重檢查：就算 validate 被繞過，通知步驟的 SEND_TEST 對非 master 也一定是 '0'
+                env = {k: render(v, Ctx("workflow_dispatch", legal, ref=ref)) for k, v in self.notify()["env"].items()}
+                self.assertEqual(env["SEND_TEST"], "0")
+        ran, out, ctx = self.simulate("workflow_dispatch", legal, ref="refs/heads/master")   # 對照：master 合法
+        self.assertEqual(out["validate"], "success")
+        self.assertTrue(ran["notify"])
+
+    def test_non_master_dispatch_without_send_test_still_runs_the_normal_flow(self):
+        ran, out, ctx = self.simulate("workflow_dispatch", {"dry_run": "false", "test_alert": "true", "send_test": "false"}, ref="refs/heads/claude/x")
+        self.assertEqual(out["validate"], "success")
+        self.assertTrue(ran["archive"])
+        env = {k: render(v, ctx) for k, v in self.notify()["env"].items()}
         self.assertEqual(env["SEND_TEST"], "0")
 
     def test_schedule_run_cannot_send_a_test_and_runs_the_normal_flow(self):
@@ -259,7 +283,7 @@ def http_err(code, body, url="https://api.telegram.org/botSECRET/sendMessage"):
 
 
 def pipe_env(**kw):
-    e = {"SEND_TEST": "1", "ALERT_EVENT_NAME": "workflow_dispatch", "ARCHIVE_DRY_RUN": "0", "ALERT_TEST": "0", "GITHUB_REPOSITORY": "o/r",
+    e = {"SEND_TEST": "1", "ALERT_EVENT_NAME": "workflow_dispatch", "ALERT_REF": "refs/heads/master", "ARCHIVE_DRY_RUN": "0", "ALERT_TEST": "0", "GITHUB_REPOSITORY": "o/r",
          "GITHUB_RUN_ID": "4242", "GITHUB_SERVER_URL": "https://github.com", "TELEGRAM_BOT_TOKEN": TOKEN, "BOT_ALERT_CHAT_ID": CHAT,
          "GH_API_TOKEN": GH, "ARCHIVE_OUTCOME": "skipped", "COMMIT_OUTCOME": "skipped"}
     e.update(kw)
@@ -409,6 +433,18 @@ class TestPipeTestGuards(PipeBase):
                 self.assertEqual(code, 1)
                 self.assertIn("只能由手動 dispatch 觸發", out)
                 self.assertEqual(self.tg.requests, [])
+
+    def test_only_master_can_send(self):
+        for ref in ("refs/heads/claude/x", "refs/heads/main", "refs/tags/master", ""):
+            with self.subTest(ref=ref):
+                code, out = self.go(env=pipe_env(ALERT_REF=ref))
+                self.assertEqual(code, 1)
+                self.assertIn("只能在 master 分支上執行", out)
+                self.assertEqual(self.tg.requests, [])
+        e = pipe_env()
+        del e["ALERT_REF"]
+        code, out = self.go(env=e)
+        self.assertEqual((code, self.tg.requests), (1, []))
 
     def test_dry_run_or_test_alert_combination_never_sends(self):
         for kw in ({"ARCHIVE_DRY_RUN": "1"}, {"ALERT_TEST": "1"}, {"ARCHIVE_DRY_RUN": "1", "ALERT_TEST": "1"}):
