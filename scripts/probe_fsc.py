@@ -461,11 +461,14 @@ def freshness(ods_max: Optional[str], ods_n: int, filenames: Dict[str, str], pag
     dnums = {e: re.findall(r"\d{7,8}", n) for e, n in filenames.items()}
     out.append("  檔名中的日期／版本數字：" + (" ｜ ".join(f"{e}: {v or '（無）'}" for e, v in dnums.items()) or "（無）"))
     out.append(f"  ODS 最大收文日期：{ods_max or '（無）'}｜舊版（{old_ref}）最大收文日期：{old_max or '（無）'}｜ODS 列數 {ods_n}｜舊版列數 {old_n}")
-    m = re.search(r"(\d{2,3})\s*[./年]\s*(\d{1,2})\s*[./月]\s*(\d{1,2})", unicodedata.normalize("NFKC", page_update or ""))
+    txt = unicodedata.normalize("NFKC", page_update or "")
     page_iso = None
+    m = re.search(r"(?<!\d)(20\d{2})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})", txt) or \
+        re.search(r"(?<!\d)(\d{2,3})\s*[./年]\s*(\d{1,2})\s*[./月]\s*(\d{1,2})", txt)
     if m:
+        y = int(m[1]) + (1911 if int(m[1]) < 1000 else 0)
         try:
-            page_iso = date(int(m[1]) + 1911, int(m[2]), int(m[3])).isoformat()
+            page_iso = date(y, int(m[2]), int(m[3])).isoformat()
         except ValueError:
             page_iso = None
     out.append(f"  頁面更新日（ISO）：{page_iso or '（無法解析）'}")

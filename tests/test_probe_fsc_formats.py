@@ -444,6 +444,11 @@ class TestFreshness(unittest.TestCase):
         self.assertIn("ODS 看起來有跟上", t)
         self.assertIn("頁面更新日（ISO）：2026-11-05", t)
 
+    def test_iso_page_date(self):
+        t = self.f("2026-11-11", 718, update="2026-11-12")
+        self.assertIn("頁面更新日（ISO）：2026-11-12", t)
+        self.assertIn("ODS 看起來有跟上", t)
+
     def test_lagging_when_not_newer(self):
         t = self.f("2026-01-10", 2)
         self.assertIn("判定落後", t)
