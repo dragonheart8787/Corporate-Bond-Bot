@@ -55,6 +55,14 @@ def ods_cell(v):
         return "<table:table-cell/>"
     if isinstance(v, tuple) and v[0] == "date":
         return f'<table:table-cell office:value-type="date" office:date-value="{v[1]}"><text:p>{v[1]}</text:p></table:table-cell>'
+    if isinstance(v, tuple) and v[0] in ("numraw", "num"):      # 數字型儲存格，office:value 逐字照寫
+        return f'<table:table-cell office:value-type="float" office:value="{v[1]}"><text:p>{v[1]}</text:p></table:table-cell>'
+    if isinstance(v, tuple) and v[0] == "paras":       # 字串型、多個 text:p
+        return '<table:table-cell office:value-type="string">' + "".join(f"<text:p>{x}</text:p>" for x in v[1]) + "</table:table-cell>"
+    if isinstance(v, tuple) and v[0] == "xml":         # 一個 text:p，內容為原始 XML（可含 text:s、text:tab）
+        return f'<table:table-cell office:value-type="string"><text:p>{v[1]}</text:p></table:table-cell>'
+    if isinstance(v, tuple) and v[0] == "type":        # 任意型別（測試被拒絕的型別）
+        return f'<table:table-cell office:value-type="{v[1]}" office:value="{v[2]}"><text:p>{v[2]}</text:p></table:table-cell>'
     if isinstance(v, tuple) and v[0] == "rep":
         return ods_cell(v[1]).replace("<table:table-cell", f'<table:table-cell table:number-columns-repeated="{v[2]}"', 1)
     if isinstance(v, (int, float)):
@@ -62,10 +70,12 @@ def ods_cell(v):
     return f'<table:table-cell office:value-type="string"><text:p>{escape(v)}</text:p></table:table-cell>'
 
 
-def make_ods(sheets, *, filler=True, doctype=False, mimetype="application/vnd.oasis.opendocument.spreadsheet", content=True):
+def make_ods(sheets, *, filler=True, row_repeats=None, doctype=False, mimetype="application/vnd.oasis.opendocument.spreadsheet", content=True):
     tables = []
     for name, rows in sheets:
-        trs = "".join("<table:table-row>" + "".join(ods_cell(v) for v in r) + "</table:table-row>" for r in rows)
+        rr = row_repeats or {}
+        trs = "".join(f'<table:table-row{" table:number-rows-repeated=%s" % chr(34) + str(rr[i]) + chr(34) if i in rr else ""}>'
+                      + "".join(ods_cell(v) for v in r) + "</table:table-row>" for i, r in enumerate(rows))
         if filler:
             trs += '<table:table-row table:number-rows-repeated="1048500"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>'
         tables.append(f'<table:table table:name="{escape(name)}">{trs}</table:table>')

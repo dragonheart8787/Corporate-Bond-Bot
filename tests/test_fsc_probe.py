@@ -59,6 +59,9 @@ def make_xlsx(sheets, *, doctype=False, extra_members=None):
                 ref = f"{col_letter(ci)}{ri}"
                 if v is None:
                     continue
+                if isinstance(v, tuple) and v[0] == "num":       # ("num", 原樣文字)：數字型儲存格，<v> 逐字照寫（模擬 Excel 寫入的數字文字）
+                    cells.append(f'<c r="{ref}"><v>{v[1]}</v></c>')
+                    continue
                 if isinstance(v, tuple):
                     kind, text, target = v
                     if kind == "link":

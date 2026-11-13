@@ -4,11 +4,19 @@
 每日留存金管會證期局「申報案件辦理情形彙總表」（115、114 兩個年度都查）。只用標準函式庫。
 只留存，不接進日報、不接進 /cb、不發任何訊息。
 
-來源頁面使用條款：引用須註明來源、確保資料完整性不得任意增刪、不得作為商業使用 → 原始 xlsx 逐位元保留，
+來源頁面使用條款：引用須註明來源、確保資料完整性不得任意增刪、不得作為商業使用 → 原始檔（xlsx，或 xlsx 消失時的 ods）逐位元保留，
 解析結果只「附加」欄位（ISO 日期、品質旗標），不修改、不刪除任何原始值。見 data/fsc/SOURCE.md。
 
 連線規則（沿用 probe_sources / fsc_sources）：只允許 https 與 sfb／fsc 主機、不跟隨轉址、不重試、
-每次最多 3 個請求（頁面 1 + 兩個年度 xlsx 各 1）、請求之間至少 6 秒；xlsx 連結每次從頁面解析（檔名含版本，不硬編）。
+每次最多 3 個請求（頁面 1 + 兩個年度檔各 1）、請求之間至少 6 秒；連結每次從頁面解析（檔名含版本，不硬編）。
+
+選檔規則（fail-closed，fsc_sources.resolve_year_source）：目標列有 .xlsx → 一律用 xlsx，xlsx 下載或解析失敗該年度就失敗，不得改用 ODS；
+沒有 .xlsx 但恰有一個 .ods → 用 ODS（2026-10-21 起 115 年的頁面只有 .xls 與 .ods）；都沒有、或有多個不同的 .ods → 失敗；.xls 一律忽略（不解析 BIFF）。
+ODS 經 fsc_sources.read_ods／ods_to_xsheets 轉成與 xlsx 相同的資料結構，之後的解析、旗標、序列化完全共用同一套程式
+（數字型儲存格的文字寫法見 ods_number_text），所以同一份資料做成 xlsx 與 ods，parsed 的 rows 逐位元相同。
+
+格式切換閘門（只在「上一版 meta 的 source_format 與本次不同」時啟用，見下方 SWITCH_* 常數）：與上一版 parsed 比對共有案件鍵比例、
+八個穩定欄位的不一致比例、ODS 檔名日期與頁面更新日期的差距、最大收文日期的落後天數；任何一項超過門檻就整個年度不寫入。
 
 輸出（預設 data/fsc/，可用 ARCHIVE_FSC_DIR 改）：
   raw/<年度>_<sha8>_<安全檔名>.xlsx   原始檔（歷次版本都留）
@@ -32,6 +40,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import io
 import json
 import os
 import re
@@ -39,6 +48,7 @@ import sys
 import time
 import unicodedata
 import urllib.parse
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -58,6 +68,22 @@ CODE_RE = re.compile(r"[0-9A-Za-z]{3,8}")
 NUMERIC_RE = re.compile(r"\d+(?:\.\d+)?")
 TOKEN_SPLIT = re.compile(r"[,，、;；\s]+")
 YEAR_LABEL_RE = re.compile(r"(\d{3})年度申報案件")
+# ── 格式切換閘門（xlsx ⇄ ods）。門檻依據：2026-11-13 的探測（上一版 10-20 xlsx 682 列 vs 11-12 ODS 718 列）──
+# 共有案件鍵 ÷ 上一版案件鍵 ≥ 90%：實測 680/682 = 99.7%（23 天間隔、僅 2 筆消失）。90% 容許一個月以上的正常汰換，
+# 但擋得住截斷、改版、或整批鍵被重寫的檔案。
+SWITCH_MIN_COMMON_KEY_PCT = 90
+# 八個穩定欄位（證券代號、案件類別、金額、幣別、收文日期、案件性質、承銷商、公司名稱）在共有鍵上，單一欄位不一致列數 ≤ 共有鍵的 2%：
+# 實測這八欄不一致皆為 0。2%（680 列約 13 列）容許來源端合理的更正，但擋得住系統性差異（例如數字寫法、空白、字元編碼不同）。
+SWITCH_MAX_COLUMN_MISMATCH_PCT = 2
+SWITCH_GATED_COLUMNS = ("證券代號", "案件類別", "金額", "幣別", "收文日期", "案件性質", "承銷商", "公司名稱")
+# 公司型態（興櫃→上櫃等）與發行價格（定價後更新）可能合理變動：不納入閘門，但在摘要列出各自的不一致筆數（實測 6 與 1）。
+SWITCH_INFO_COLUMNS = ("公司型態", "發行價格")
+# 新鮮度一：檔名內的民國日期與頁面更新日期相差 ≤ 3 天。實測兩者相差 0 天（1151112 與 2026-11-12）；
+# 3 天容許假日與頁面晚更新，擋住「檔名是舊版本、頁面卻已更新」的落後檔（2026-10-08 曾出現 xlsx 為 v3、ods 檔名仍為 v1）。
+SWITCH_MAX_FILE_PAGE_GAP_DAYS = 3
+# 新鮮度二：最大收文日期不得比頁面更新日早超過 14 天。實測差 1 天；收文是逐日發生，落後兩週以上代表內容沒有跟上。
+SWITCH_MAX_RECEIPT_LAG_DAYS = 14
+ODS_ACCEPT = "application/vnd.oasis.opendocument.spreadsheet, application/octet-stream;q=0.9, */*;q=0.5"
 MAX_LISTED_ROWS = 200
 MAX_TRAILER_LOG_CHARS = 80
 TAIPEI = timezone(timedelta(hours=8))
@@ -136,14 +162,14 @@ def read_json(path: str, what: str) -> Optional[Any]:
         raise ArchiveError(f"既有的{what} {path} 無法讀取（{type(e).__name__}），為避免覆蓋已留存的資料，不處理") from e
 
 
-def safe_filename(decoded: str) -> str:
-    """百分比編碼解碼後的檔名 → 安全檔名：只留文字／數字／. - _ ( )，其餘換成 _；不含路徑分隔、不以 . 開頭。"""
+def safe_filename(decoded: str, ext: str = ".xlsx") -> str:
+    """百分比編碼解碼後的檔名 → 安全檔名：只留文字／數字／. - _ ( )，其餘換成 _；不含路徑分隔、不以 . 開頭；副檔名保留（xlsx 或 ods）。"""
     name = unicodedata.normalize("NFC", decoded).replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r"[^\w.\-()]", "_", name).lstrip(".")
-    if not name.lower().endswith(".xlsx"):
-        name = (name or "file") + ".xlsx"
+    if not name.lower().endswith(ext):
+        name = (name or "file") + ext
     if len(name) > 80:
-        name = name[:75] + ".xlsx"
+        name = name[:80 - len(ext)] + ext
     return name
 
 
@@ -219,11 +245,31 @@ def _is_trailer_like(vals: List[str], code_i: int) -> bool:
     return not CODE_RE.fullmatch(code)
 
 
-def parse_sheet(data: bytes) -> SheetParse:
+def read_source_sheets(data: bytes, fmt: str) -> List[fs.XSheet]:
+    """原始檔位元組 → 工作表（xlsx 與 ods 共用同一種資料結構）。fmt 由選檔規則決定，這裡不會猜格式、不會改用另一種。"""
+    if fmt == "ods":
+        cat, desc = pf.sniff(data)
+        if cat != "zip":
+            raise ArchiveError(f"ods 無法解析：檔案開頭不是 zip（{desc}）；副檔名與實際格式不符或被阻擋頁取代")
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                mt = zf.read("mimetype")[:200].decode("ascii", "replace").strip() if "mimetype" in zf.namelist() else None
+        except zipfile.BadZipFile as e:
+            raise ArchiveError(f"ods 無法解析：zip 結構損毀（{e}）") from None
+        if mt != fs.ODS_MIME:
+            raise ArchiveError(f"ods 無法解析：zip 的 mimetype {'缺少' if mt is None else '不是 ODS（' + repr(mt[:60]) + '）'}")
+        try:
+            return fs.ods_to_xsheets(fs.read_ods(data))
+        except fs.FscError as e:
+            raise ArchiveError(f"ods 無法解析：{e}") from None
     try:
-        sheets = fs.read_xlsx(data)
+        return fs.read_xlsx(data)
     except fs.FscError as e:
         raise ArchiveError(f"xlsx 無法解析：{e}") from None
+
+
+def parse_sheet(data: bytes, fmt: str = "xlsx") -> SheetParse:
+    sheets = read_source_sheets(data, fmt)
     if len(sheets) != 1:
         raise ArchiveError(f"工作表數量為 {len(sheets)}（預期恰好 1 個），格式可能改版，不寫入")
     sheet = sheets[0]
@@ -332,7 +378,8 @@ def build_case_rows(sp: SheetParse, ref_iso: Optional[str]) -> List[Dict[str, An
 # ─────────────────────────────────────────
 # 版本比對
 # ─────────────────────────────────────────
-def compute_diff(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]], year: str, old_sha: str, new_sha: str) -> Dict[str, Any]:
+def compute_diff(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]], year: str, old_sha: str, new_sha: str,
+                 fmt_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     old = {r["id"]: r for r in old_rows}
     new = {r["id"]: r for r in new_rows}
     added = sorted(set(new) - set(old))
@@ -343,12 +390,66 @@ def compute_diff(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]],
             a, b = old[i]["fields"].get(f, ""), new[i]["fields"].get(f, "")
             if a != b:
                 changed.append({"id": i, "field": f, "old": a, "new": b})
-    return {
+    obj = {
         "version": STORE_VERSION, "year": year, "old_sha256": old_sha, "new_sha256": new_sha,
         "counts": {"added": len(added), "vanished": len(vanished), "changed_fields": len(changed),
                    "old_rows": len(old_rows), "new_rows": len(new_rows)},
         "added": added, "vanished": vanished, "changed": changed,
+        "format_change": False,
     }
+    if fmt_info:
+        obj.update(fmt_info)     # format_change、old_format、new_format、old_version_date、new_version_date、switch_gate（閘門的實際數值）
+    return obj
+
+
+# ─────────────────────────────────────────
+# 格式切換閘門
+# ─────────────────────────────────────────
+def _days_between(a: str, b: str) -> int:
+    return (date.fromisoformat(a) - date.fromisoformat(b)).days
+
+
+def check_format_switch(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]], file_iso: Optional[str],
+                        page_iso: Optional[str]) -> Dict[str, Any]:
+    """
+    上一版與本次的原始檔格式不同時才呼叫。任何一項超過門檻就 ArchiveError（該年度完全不寫入）。
+    回傳實際數值（只有數字），供摘要與 diffs 檔記錄。
+    """
+    old = {r["id"]: r for r in old_rows}
+    new = {r["id"]: r for r in new_rows}
+    common = sorted(set(old) & set(new))
+    stats: Dict[str, Any] = {"old_keys": len(old), "new_keys": len(new), "common_keys": len(common)}
+    if not old:
+        raise ArchiveError("格式切換：上一版沒有任何案件鍵，無法比對，不寫入")
+    # 共有鍵比例：common ÷ old ≥ 90%（用整數比較避免浮點誤差）
+    stats["common_key_pct"] = round(100 * len(common) / len(old), 2)
+    if len(common) * 100 < SWITCH_MIN_COMMON_KEY_PCT * len(old):
+        raise ArchiveError(f"格式切換閘門：共有案件鍵 {len(common)}／上一版 {len(old)}（{stats['common_key_pct']}%）"
+                           f"低於 {SWITCH_MIN_COMMON_KEY_PCT}%，不寫入")
+    mism: Dict[str, int] = {}
+    for col in SWITCH_GATED_COLUMNS + SWITCH_INFO_COLUMNS:
+        mism[col] = sum(1 for i in common if old[i]["fields"].get(col, "") != new[i]["fields"].get(col, ""))
+    stats["mismatch"] = {c: mism[c] for c in SWITCH_GATED_COLUMNS}
+    stats["info_mismatch"] = {c: mism[c] for c in SWITCH_INFO_COLUMNS}
+    for col in SWITCH_GATED_COLUMNS:
+        if mism[col] * 100 > SWITCH_MAX_COLUMN_MISMATCH_PCT * len(common):
+            raise ArchiveError(f"格式切換閘門：共有案件鍵 {len(common)} 筆中，「{col}」不一致 {mism[col]} 筆"
+                               f"（超過 {SWITCH_MAX_COLUMN_MISMATCH_PCT}%），不寫入")
+    # 新鮮度：無法驗證就當作不通過（fail-closed）
+    if not file_iso or not page_iso:
+        raise ArchiveError("格式切換閘門：檔名日期或頁面更新日期無法解析，無法驗證新鮮度，不寫入")
+    gap = abs(_days_between(file_iso, page_iso))
+    stats["filename_page_gap_days"] = gap
+    if gap > SWITCH_MAX_FILE_PAGE_GAP_DAYS:
+        raise ArchiveError(f"格式切換閘門：檔名日期與頁面更新日期相差 {gap} 天（超過 {SWITCH_MAX_FILE_PAGE_GAP_DAYS} 天），不寫入")
+    receipts = [i for r in new_rows for i in (r["dates_iso"].get("收文日期") or []) if i]
+    if not receipts:
+        raise ArchiveError("格式切換閘門：新版沒有可解析的收文日期，無法驗證新鮮度，不寫入")
+    lag = _days_between(page_iso, max(receipts))
+    stats["max_receipt_lag_days"] = lag
+    if lag > SWITCH_MAX_RECEIPT_LAG_DAYS:
+        raise ArchiveError(f"格式切換閘門：最大收文日期比頁面更新日早 {lag} 天（超過 {SWITCH_MAX_RECEIPT_LAG_DAYS} 天），不寫入")
+    return stats
 
 
 def validate_meta(meta: Any, path: str) -> Dict[str, Any]:
@@ -380,13 +481,17 @@ class YearResult:
     meta: Dict[str, Any] = field(default_factory=dict)
     ref_iso: Optional[str] = None
     wrote: List[str] = field(default_factory=list)
+    diff: Optional[Dict[str, Any]] = None        # 與前一版的比對（新版本時）；含 format_change 與閘門數值
 
 
-def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_text: str, directory: str, today: str) -> YearResult:
+def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_text: str, directory: str, today: str,
+                 fmt: Optional[str] = None) -> YearResult:
+    fmt = fmt or getattr(link, "fmt", "xlsx")
+    ext = "." + fmt
     res = YearResult(year, label)
     sha = hashlib.sha256(body).hexdigest()
     sha8 = sha[:8]
-    sp = parse_sheet(body)
+    sp = parse_sheet(body, fmt)
     if sp.sheet_name != EXPECTED_SHEET_NAME:
         log(f"::warning title=工作表名稱不同 {label}::工作表名稱與先前確認的不同（長度 {len(sp.sheet_name)}），表頭已通過比對，繼續處理並記錄在 meta")
 
@@ -410,16 +515,29 @@ def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_t
             raise ArchiveError(f"資料列數 {new_n} 比前一版 {prev_n} 少 {prev_n - new_n} 列"
                                f"（≥{100 * MAX_DROP_NUM // MAX_DROP_DEN}%），疑似資料被截斷或改版，不寫入")
 
+    # 格式切換閘門：上一版的來源格式與本次不同才啟用（舊 meta 沒有 source_format → 視為 xlsx）。任何寫入之前判斷。
+    prev_fmt = prev_meta.get("source_format", "xlsx") if prev_meta else None
+    switched = bool(prev_meta and not same and prev_fmt != fmt)
+    old_rows: List[Dict[str, Any]] = load_prev_rows(parsed_path) if prev_meta and not same else []
+    gate: Optional[Dict[str, Any]] = check_format_switch(old_rows, rows, file_iso, page_iso) if switched else None
+
     history = list(prev_meta["history"]) if prev_meta else []
     entry = next((h for h in history if h.get("sha256") == sha), None)
     if entry is None:
-        entry = {"sha256": sha, "sha8": sha8, "first_seen": today, "size": len(body), "filename": decoded}
+        entry = {"sha256": sha, "sha8": sha8, "first_seen": today, "size": len(body), "filename": decoded, "format": fmt}
         history.append(entry)
 
     diff_obj = None
     if prev_meta and not same:
-        old_rows = load_prev_rows(parsed_path)
-        diff_obj = compute_diff(old_rows, rows, year, prev_meta["sha256"], sha)
+        fmt_info = None
+        if switched:
+            fmt_info = {"format_change": True, "old_format": prev_fmt, "new_format": fmt,
+                        "old_version_date": prev_meta.get("reference_date"), "new_version_date": ref_iso,
+                        "switch_gate": gate}
+        else:
+            fmt_info = {"old_format": prev_fmt, "new_format": fmt,
+                        "old_version_date": prev_meta.get("reference_date"), "new_version_date": ref_iso}
+        diff_obj = compute_diff(old_rows, rows, year, prev_meta["sha256"], sha, fmt_info)
 
     meta = {
         "version": STORE_VERSION,
@@ -432,7 +550,9 @@ def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_t
         "link_text": link.anchor_text,
         "filename_original": link.filename,
         "filename_decoded": decoded,
-        "filename_safe": safe_filename(decoded),
+        "filename_safe": safe_filename(decoded, ext),
+        "source_format": fmt,
+        "source_ext": getattr(link, "ext", ext),
         "file_version": file_version(decoded),
         "page_update_text": used_page_text,
         "source_date_filename": file_iso,
@@ -465,12 +585,13 @@ def process_year(year: str, label: str, link: fs.LinkChoice, body: bytes, page_t
         if write_bytes_atomic(dp, dump_meta(diff_obj)):
             res.wrote.append(dp)
         c = diff_obj["counts"]
-        log(f"  新版本：與前一版比對 新增 {c['added']}、消失 {c['vanished']}、同鍵欄位變更 {c['changed_fields']}")
+        log(f"  新版本{'（⚠ 跨格式切換 ' + str(prev_fmt) + ' → ' + fmt + '）' if switched else ''}："
+            f"與前一版比對 新增 {c['added']}、消失 {c['vanished']}、同鍵欄位變更 {c['changed_fields']}")
     # meta 最後寫：它是「這個版本已完整留存」的標記，中途失敗下次會重做
     for path, data in ((parsed_path, dump_rows_file(head, rows)), (meta_path, dump_meta(meta))):
         if write_bytes_atomic(path, data):
             res.wrote.append(path)
-    res.ok, res.rows, res.meta, res.ref_iso = True, rows, meta, ref_iso
+    res.ok, res.rows, res.meta, res.ref_iso, res.diff = True, rows, meta, ref_iso, diff_obj
     res.status = "unchanged" if same else ("new-version" if prev_meta else "first")
     return res
 
@@ -500,6 +621,19 @@ def date_shape_counts(rows: List[Dict[str, Any]], col: str) -> Dict[str, int]:
 def summarize_year(res: YearResult) -> List[str]:
     rows, m = res.rows, res.meta
     out = [f"### {res.label}（{res.status}）"]
+    out.append(f"- 來源格式：{m.get('source_format', 'xlsx')}（連結副檔名 {m.get('source_ext', '.xlsx')}）｜原始檔 raw/{res.year}_{m['sha256'][:8]}_{m['filename_safe']}")
+    d = res.diff
+    if d and d.get("format_change"):
+        c, g = d["counts"], d["switch_gate"]
+        out.append(f"- ⚠ 跨格式切換：{d['old_format']} → {d['new_format']}｜上一版日期 {d['old_version_date'] or '（無）'} → 本版 {d['new_version_date'] or '（無）'}")
+        out.append(f"  - 與上一版 diff：新增 {c['added']}、消失 {c['vanished']}、同鍵欄位變動 {c['changed_fields']}（上一版 {c['old_rows']} 列 → 本版 {c['new_rows']} 列）")
+        out.append(f"  - 閘門（通過）：案件鍵 上一版 {g['old_keys']}／本版 {g['new_keys']}／共有 {g['common_keys']}"
+                   f"（{g['common_key_pct']}%，門檻 ≥ {SWITCH_MIN_COMMON_KEY_PCT}%）")
+        out.append("  - 閘門欄位不一致筆數（門檻 ≤ 共有鍵的 %d%%）：" % SWITCH_MAX_COLUMN_MISMATCH_PCT
+                   + "；".join(f"{k}={v}" for k, v in g["mismatch"].items()))
+        out.append("  - 不納入閘門、僅列出：" + "；".join(f"{k}={v}" for k, v in g["info_mismatch"].items()))
+        out.append(f"  - 新鮮度：檔名日期與頁面更新日相差 {g['filename_page_gap_days']} 天（門檻 ≤ {SWITCH_MAX_FILE_PAGE_GAP_DAYS}）；"
+                   f"最大收文日期比頁面更新日早 {g['max_receipt_lag_days']} 天（門檻 ≤ {SWITCH_MAX_RECEIPT_LAG_DAYS}）")
     rc = m["row_counts"]
     trail_total = rc["trailer_rows"] + rc.get("trailing_blank_rows", 0)
     out.append(f"- 版本 sha8={m['sha256'][:8]}｜大小 {m['size']} bytes｜資料列 {rc['data_rows']}、結尾列 {trail_total}"
@@ -611,7 +745,7 @@ def run(
         log("🧪 DRY-RUN：不連線、不寫檔。最多送 3 次 GET（間隔 %.0f 秒）：" % ps.INTERVAL_SEC)
         log(f"  1. 頁面：{page_url}")
         for _, lab in YEARS:
-            log(f"  - 從頁面解析「{lab}」那一列的 .xlsx 連結後 GET 一次（連結每次從頁面解析，不硬編）")
+            log(f"  - 從頁面解析「{lab}」那一列的連結後 GET 一次：有 .xlsx 用 .xlsx；沒有 .xlsx 且恰有一個 .ods 才用 .ods（連結每次從頁面解析，不硬編）")
         log(f"輸出目錄：{directory}")
         log(f"User-Agent：{ua}")
         return 0
@@ -645,11 +779,11 @@ def run(
     if unknown:
         log(f"::warning title=頁面出現未納入留存的年度::{'、'.join(unknown)}（目前只留存 {'、'.join(l for _, l in YEARS)}，需要時請更新 YEARS）")
 
-    links: Dict[str, fs.LinkChoice] = {}
+    links: Dict[str, fs.SourceChoice] = {}
     for year, label in YEARS:
         try:
-            links[year] = fs.resolve_year_link(html, page_url, label)
-            log(f"  「{label}」→ {links[year].filename}")
+            links[year] = fs.resolve_year_source(html, page_url, label)
+            log(f"  「{label}」→ {links[year].filename}（格式 {links[year].fmt}）")
         except fs.FscError as e:
             failed += 1
             log(f"::error title=留存失敗 {label}::{e}")
@@ -661,7 +795,7 @@ def run(
             continue
         sleep(max(ps.INTERVAL_SEC, ps.MIN_INTERVAL_SEC))
         link = links[year]
-        xr = ps.fetch_once(link.url, ua, opener, accept=pf.XLSX_ACCEPT)
+        xr = ps.fetch_once(link.url, ua, opener, accept=pf.XLSX_ACCEPT if link.fmt == "xlsx" else ODS_ACCEPT)
         log(f"== [{label}] HTTP {xr.status if xr.status is not None else '無回應'}｜{xr.size} bytes")
         if xr.error or xr.truncated:
             reason = xr.error or "回應超過大小上限，被截斷"
@@ -669,7 +803,7 @@ def run(
             log(f"::error title=留存失敗 {label}::{reason}" + (f"（轉址目的主機：{xr.location_host}）" if xr.location_host else ""))
             continue
         try:
-            res = process_year(year, label, link, xr.body, page_text, directory, today)
+            res = process_year(year, label, link, xr.body, page_text, directory, today, link.fmt)
         except ArchiveError as e:
             failed += 1
             log(f"::error title=留存失敗 {label}::{e}")

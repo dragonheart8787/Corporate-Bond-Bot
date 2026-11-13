@@ -198,6 +198,10 @@ class LinkChoice:
     filename: str
 
 
+class NoXlsxLink(FscError):
+    """目標列存在且唯一，但沒有 .xlsx 連結（呼叫端可據此改找 .ods）。其他失敗仍是一般 FscError。"""
+
+
 def resolve_year_link(html: str, page_url: str, label: str, allowed: Optional[set] = None) -> LinkChoice:
     """
     找出『某儲存格文字完全等於 label』的那一列，回傳該列唯一的 .xlsx 連結（ODS 與其他附件忽略）。
@@ -227,7 +231,7 @@ def resolve_year_link(html: str, page_url: str, label: str, allowed: Optional[se
         uniq.setdefault(u, t)
     diag.append(f"該列的連結副檔名：{sorted({_ext(h) or '（無）' for h, _ in links})}")
     if not uniq:
-        raise FscError(f"「{target}」那一列沒有 .xlsx 連結", diag)
+        raise NoXlsxLink(f"「{target}」那一列沒有 .xlsx 連結", diag)
     if len(uniq) > 1:
         names = [u.rsplit("/", 1)[-1] for u in uniq]
         raise FscError(f"「{target}」那一列有 {len(uniq)} 個不同的 .xlsx 連結：{names}，無法確定", diag)
@@ -238,6 +242,44 @@ def resolve_year_link(html: str, page_url: str, label: str, allowed: Optional[se
     if (u.hostname or "").lower() not in allowed:
         raise FscError(f"「{target}」的 xlsx 連結主機 {u.hostname!r} 不在白名單", diag)
     return LinkChoice(url, text[:60], u.path.rsplit("/", 1)[-1])
+
+
+@dataclass
+class SourceChoice(LinkChoice):
+    fmt: str = "xlsx"            # xlsx | ods（選檔結果；.xls 一律忽略）
+    ext: str = ".xlsx"           # 來源連結的副檔名
+
+
+def resolve_year_source(html: str, page_url: str, label: str, allowed: Optional[set] = None) -> SourceChoice:
+    """
+    選檔規則（fail-closed）：
+      目標列有 .xlsx → 一律用 xlsx（行為與 resolve_year_link 完全相同；之後 xlsx 失敗不得改用 ODS）。
+      沒有 .xlsx、恰有一個 .ods → 用 ODS。沒有 .ods → 失敗；多個不同的 .ods → 失敗（無法確定）。.xls 一律忽略。
+    """
+    allowed = FSC_HOSTS if allowed is None else allowed
+    try:
+        ch = resolve_year_link(html, page_url, label, allowed)
+        return SourceChoice(ch.url, ch.anchor_text, ch.filename, "xlsx", ".xlsx")
+    except NoXlsxLink as e:
+        first = e
+    links = row_links(html, page_url, label, allowed)        # 此時目標列已確定存在且唯一
+    ods = []
+    seen = set()
+    for l in links:
+        if l.ext == ".ods" and l.url not in seen:
+            seen.add(l.url)
+            ods.append(l)
+    exts = sorted({l.ext for l in links})
+    diag = list(first.diagnostics) + [f"該列的連結副檔名（含查詢字串判斷）：{exts or ['（無）']}"]
+    target = norm_label(label)
+    if not ods:
+        raise FscError(f"「{target}」那一列沒有 .xlsx 也沒有 .ods 連結（.xls 不使用）", diag)
+    if len(ods) > 1:
+        raise FscError(f"「{target}」那一列有 {len(ods)} 個不同的 .ods 連結：{[l.filename for l in ods]}，無法確定", diag)
+    o = ods[0]
+    if not o.allowed:
+        raise FscError(f"「{target}」的 ods 連結不是 https 或主機 {o.host!r} 不在白名單", diag)
+    return SourceChoice(o.url, o.anchor_text, urllib.parse.urlparse(o.url).path.rsplit("/", 1)[-1], "ods", ".ods")
 
 
 @dataclass
@@ -528,13 +570,14 @@ _ODS = {
     "table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
     "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
 }
-MAX_ODS_COLS = 500
-MAX_EMPTY_REPEAT = 1000        # 超過這個數的「空白重複列／欄」視為結尾填充（ODS 常用 1048576 列的重複空列），不展開
+MAX_ODS_REPEAT = 2000          # 單一 number-columns-repeated／number-rows-repeated 的上限（需要被展開時；純結尾空白不展開、不受此限）
+MAX_ODS_CELLS = 2_000_000      # 整份檔案展開後的儲存格總數上限
+MAX_ODS_COLS = 500             # 一列修剪結尾空白後的寬度上限
 
 
 @dataclass
 class OCell:
-    text: str = ""          # 顯示文字（text:p 內容；text:s 展開成空白）
+    text: str = ""          # 顯示文字（各 text:p 以換行串接；text:s 展開成空白、text:tab 為 \t、text:line-break 為 \n）
     vtype: str = ""         # office:value-type：string | float | date | percentage | currency | boolean | time；空儲存格為 ""
     value: str = ""         # office:value／date-value／string-value／boolean-value／time-value（取得到的那個）
 
@@ -572,13 +615,24 @@ def _ods_text(node: ET.Element) -> str:
 
 def _repeat(el: ET.Element, attr: str) -> int:
     try:
-        return max(1, int(el.get(_q("table", attr), "1")))
+        n = int(el.get(_q("table", attr), "1"))
     except ValueError:
         raise FscError(f"ODS 的 {attr} 不是整數") from None
+    if n < 1:
+        raise FscError(f"ODS 的 {attr} 不是正整數")
+    return n
+
+
+def _is_empty_cell(c: OCell) -> bool:
+    return not c.text and not c.vtype
 
 
 def read_ods(data: bytes) -> List[OSheet]:
-    """ODS 位元組 → 各工作表。壞檔、非 ODS（mimetype 不符）、DTD、過大、重複展開過多 → FscError。"""
+    """
+    ODS 位元組 → 各工作表。壞檔、非 ODS（mimetype 不符）、DTD、過大、重複展開過多、巢狀表格 → FscError。
+    重複規則：結尾的空白欄／空白列（包括 ODS 常見的 1048576 列重複空列）一律修剪、不展開；
+    需要被展開的重複（非空，或後面還有內容的空白）超過 MAX_ODS_REPEAT 就報錯，不靜默丟棄（否則列號會位移）。
+    """
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as e:
@@ -600,13 +654,18 @@ def read_ods(data: bytes) -> List[OSheet]:
     cur_rows: Optional[List[List[OCell]]] = None
     cur_name = ""
     cells: List[OCell] = []
+    pending_cells = 0           # 目前這一列：已看到、但後面還沒有內容的空白儲存格數
+    pending_rows = 0            # 目前這張表：已看到、但後面還沒有內容的空白列數
+    total_cells = 0
     total_rows = 0
     try:
         for ev, el in ET.iterparse(zf.open("content.xml"), events=("start", "end")):
             tag = el.tag
             if ev == "start":
-                if tag == _q("table", "table") and cur_rows is None:
-                    cur_rows, cur_name, cells = [], el.get(_q("table", "name"), ""), []
+                if tag == _q("table", "table"):
+                    if cur_rows is not None:
+                        raise FscError("ODS 含巢狀表格，拒絕解析")
+                    cur_rows, cur_name, cells, pending_cells, pending_rows = [], el.get(_q("table", "name"), ""), [], 0, 0
                 continue
             if tag in (_q("table", "table-cell"), _q("table", "covered-table-cell")):
                 vtype = el.get(_q("office", "value-type"), "") if tag == _q("table", "table-cell") else ""
@@ -619,38 +678,92 @@ def read_ods(data: bytes) -> List[OSheet]:
                 text = "\n".join(_ods_text(p) for p in el.findall("text:p", _ODS))
                 c = OCell(text, vtype, value)
                 n = _repeat(el, "number-columns-repeated")
-                empty = not c.text and not c.vtype
-                if n > MAX_EMPTY_REPEAT and empty:
-                    pass                                  # 列尾的空白填充：不展開
-                elif n > MAX_ODS_COLS:
-                    raise FscError(f"ODS 有 {n} 欄重複的非空儲存格，拒絕展開")
+                if _is_empty_cell(c):
+                    pending_cells += n
                 else:
+                    if n > MAX_ODS_REPEAT:
+                        raise FscError(f"ODS 有 {n} 欄重複的非空儲存格（上限 {MAX_ODS_REPEAT}），拒絕展開")
+                    if pending_cells > MAX_ODS_REPEAT:
+                        raise FscError(f"ODS 的列中間有 {pending_cells} 個連續空白儲存格（上限 {MAX_ODS_REPEAT}），拒絕展開")
+                    cells.extend(OCell() for _ in range(pending_cells))
+                    pending_cells = 0
                     cells.extend(OCell(c.text, c.vtype, c.value) for _ in range(n))
-                    if len(cells) > MAX_ODS_COLS * 4:
-                        raise FscError("ODS 單列欄數過多")
+                    if len(cells) > MAX_ODS_COLS:
+                        raise FscError(f"ODS 單列寬度超過 {MAX_ODS_COLS} 欄")
                 el.clear()
             elif tag == _q("table", "table-row") and cur_rows is not None:
-                while cells and not cells[-1].text and not cells[-1].vtype:
-                    cells.pop()                           # 去掉列尾空儲存格（與 xlsx 讀取的寬度語意一致）
                 n = _repeat(el, "number-rows-repeated")
-                if not cells and n > MAX_EMPTY_REPEAT:
-                    pass                                  # 表尾的空白填充列
+                if not cells:
+                    pending_rows += n                     # 全空列：先記著，後面還有內容才需要展開
                 else:
-                    total_rows += n
+                    if n > MAX_ODS_REPEAT:
+                        raise FscError(f"ODS 有 {n} 列重複的非空列（上限 {MAX_ODS_REPEAT}），拒絕展開")
+                    if pending_rows > MAX_ODS_REPEAT:
+                        raise FscError(f"ODS 的表格中間有 {pending_rows} 個連續空白列（上限 {MAX_ODS_REPEAT}），拒絕展開")
+                    total_cells += len(cells) * n
+                    if total_cells > MAX_ODS_CELLS:
+                        raise FscError(f"ODS 展開後的儲存格總數超過 {MAX_ODS_CELLS}，拒絕解析")
+                    total_rows += pending_rows + n
                     if total_rows > MAX_ROWS:
                         raise FscError(f"ODS 超過 {MAX_ROWS} 列，拒絕解析")
+                    cur_rows.extend([] for _ in range(pending_rows))
+                    pending_rows = 0
                     for _ in range(n):
                         cur_rows.append([OCell(c.text, c.vtype, c.value) for c in cells])
-                cells = []
+                cells, pending_cells = [], 0
                 el.clear()
             elif tag == _q("table", "table") and cur_rows is not None:
-                while cur_rows and not any(c.text or c.vtype for c in cur_rows[-1]):
-                    cur_rows.pop()                        # 表尾的全空列不保留（填充）
-                sheets.append(OSheet(cur_name, cur_rows))
-                cur_rows, cells = None, []
+                sheets.append(OSheet(cur_name, cur_rows))   # 結尾的全空列（pending_rows）不保留
+                cur_rows, cells, pending_cells, pending_rows = None, [], 0, 0
                 el.clear()
     except ET.ParseError as e:
         raise FscError(f"ODS 的 content.xml 無法解析：{e}") from None
     if not sheets:
         raise FscError("ODS 內沒有任何工作表")
     return sheets
+
+
+def ods_number_text(raw: str) -> str:
+    """
+    ODS 的 office:value → 與 xlsx 版「數字型儲存格的原樣文字」同樣的寫法。
+    xlsx 版（read_xlsx）對數字型儲存格直接取 <v> 的原樣文字；Excel 寫入時整數值沒有小數點、沒有指數（88888888），
+    非整數值是最短的十進位表示（12.5）。這裡把 ODS 的數字統一成同樣的寫法：整數值不帶 ".0" 或指數，
+    非整數值去掉多餘的尾端 0，不用指數。無法解析（含 NaN／無限大）→ FscError。
+    """
+    from decimal import Decimal, InvalidOperation
+    t = (raw or "").strip()
+    try:
+        d = Decimal(t)
+    except InvalidOperation:
+        raise FscError("ODS 數字型儲存格的值無法解析") from None
+    if not d.is_finite():
+        raise FscError("ODS 數字型儲存格的值不是有限數字")
+    if d == d.to_integral_value():
+        return str(int(d))
+    return format(d.normalize(), "f")
+
+
+ODS_NUMBER_TYPES = ("float",)
+ODS_STRING_TYPES = ("string",)
+
+
+def ods_to_xsheets(sheets: List[OSheet]) -> List[XSheet]:
+    """OSheet → XSheet（與 xlsx 解析後同樣的資料結構），讓 archive_fsc 的下游完全共用。
+    只接受 string 與 float 型別；date／time／boolean／currency／percentage 等無法保證與 xlsx 規則一致，一律報錯（fail-closed）。"""
+    out: List[XSheet] = []
+    for sh in sheets:
+        rows: List[List[XCell]] = []
+        for ri, r in enumerate(sh.rows, 1):
+            row: List[XCell] = []
+            for c in r:
+                if _is_empty_cell(c):
+                    row.append(XCell())
+                elif c.vtype in ODS_STRING_TYPES or (not c.vtype and c.text):
+                    row.append(XCell(c.text if c.text != "" else c.value, "str"))
+                elif c.vtype in ODS_NUMBER_TYPES:
+                    row.append(XCell(ods_number_text(c.value), "num"))
+                else:
+                    raise FscError(f"ODS 第 {ri} 列有型別為 {c.vtype!r} 的儲存格，無法與 xlsx 規則一致地轉換，拒絕處理")
+            rows.append(row)
+        out.append(XSheet(sh.name, rows))
+    return out

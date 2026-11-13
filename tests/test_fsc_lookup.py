@@ -162,6 +162,8 @@ class TestUnrecognizedCode(Base):
 
 
 class TestDataHealth(Base):
+    """所有年度都沒有可讀資料 → 整個查詢拒絕（單一年度的問題見 TestPerYear）。"""
+
     def assert_refused(self, out, needle):
         self.assertEqual(len(out), 1)
         self.assertTrue(out[0].startswith(f"{HEAD}申報表資料缺失/過舊，未查詢（原因："), out[0])
@@ -171,41 +173,159 @@ class TestDataHealth(Base):
     def test_missing_directory_and_files(self):
         self.good([prow("1001")])
         os.remove(os.path.join(self.d.dir, "parsed", "115.json"))
+        os.remove(os.path.join(self.d.dir, "parsed", "114.json"))
         self.assert_refused(self.lines("1001"), "parsed/115.json 檔案不存在")
         shutil.rmtree(self.d.dir)
         self.assert_refused(self.lines("1001"), "meta/115.json 檔案不存在")
 
-    def test_corrupt_files_and_version_mismatch(self):
+    def test_corrupt_files_and_version_mismatch_on_every_year(self):
         self.good([prow("1001")])
         self.d.write("parsed/115.json", None, raw="{broken")
+        self.d.write("parsed/114.json", None, raw="{broken")
         self.assert_refused(self.lines("1001"), "parsed/115.json 無法讀取")
         self.d.year("115", [prow("1001")], parsed_sha="b" * 64)
+        self.d.year("114", [prow("1001")], parsed_sha="b" * 64)
         self.assert_refused(self.lines("1001"), "版本（sha256）不一致")
 
-    def test_stale_by_last_check_date_refuses_even_though_rows_exist(self):
-        self.good([prow("1001")], check={"115": days_ago(4), "114": "2026-10-12"})
-        self.assert_refused(self.lines("1001"), "申報進度資料過舊(最後成功檢查 2026-10-08)")
-        self.good([prow("1001")], check={"115": days_ago(3), "114": "2026-10-12"})
-        self.assertIn("共 1 筆", self.lines("1001")[0])
-
-    def test_one_year_stale_refuses_the_whole_lookup(self):
-        self.good([prow("1001")], check={"115": "2026-10-12", "114": days_ago(9)})
-        self.assert_refused(self.lines("1001"), "114年檔：申報進度資料過舊")
-
-    def test_old_rule_when_no_record_and_future_first_seen(self):
-        self.d.year("115", [prow("1001")], first_seen=days_ago(8))
-        self.d.year("114", [])
-        self.assert_refused(self.lines("1001"), "尚無檢查紀錄")
+    def test_future_first_seen_on_every_year_is_refused(self):
         self.d.year("115", [prow("1001")], first_seen=days_ago(-2))
+        self.d.year("114", [prow("1001")], first_seen=days_ago(-2))
         self.assert_refused(self.lines("1001"), "晚於今日")
 
-    def test_the_gate_is_the_same_as_the_progress_block(self):
-        for check in ({"115": "2026-10-12", "114": "2026-10-12"}, {"115": days_ago(4), "114": "2026-10-12"}, None):
+    def test_block_state_is_still_whole_report_based(self):
+        """「📑 金管會申報進度」區塊的過舊警示不變：只要有一個年度過舊，區塊就是「過舊」（查詢行另外逐年度處理）。"""
+        for check, want in (({"115": "2026-10-12", "114": "2026-10-12"}, "正常"), ({"115": days_ago(4), "114": "2026-10-12"}, "過舊"),
+                            ({"115": "2026-10-12", "114": days_ago(9)}, "過舊")):
             self.good([prow("1001")], check=check)
-            now = NOW
-            asm_state = fp.build_report(now, self.d.dir).state
-            refused = self.lines("1001")[0].startswith(f"{HEAD}申報表資料缺失/過舊")
-            self.assertEqual(refused, asm_state != "正常", check)
+            self.assertEqual(fp.build_report(NOW, self.d.dir).state, want, check)
+            self.assertIn("共 1 筆", self.lines("1001")[0])
+
+
+def asof(d):
+    return f"（資料截至 {d}，可能未更新）"
+
+
+class TestPerYear(Base):
+    """各年度分開判斷：過舊 → 仍查、行尾註明截至日；缺失 → 該年度不查並在行內說明；不得因一年的問題讓另一年的查詢消失。"""
+
+    def rows_of(self, out):
+        return [ln for ln in out if ln.startswith("  • ")]
+
+    def setUp(self):
+        super().setUp()
+        self.r115 = prow("7610", receipt="2026-10-05", amount="1200000000", eff="2026-10-22")
+        self.r114 = prow("7610", receipt="2025-03-01", closing="生效", eff="2025-03-20", amount="300000000")
+
+    def test_both_years_healthy_no_marks(self):
+        self.good([self.r115], [self.r114])
+        out = self.lines("7610")
+        self.assertEqual(len(self.rows_of(out)), 2)
+        self.assertNotIn("資料截至", "\n".join(out))
+        self.assertNotIn("未查該年度", "\n".join(out))
+
+    def test_only_115_stale_marks_only_115_rows_with_115s_last_check_date(self):
+        self.good([self.r115], [self.r114], check={"115": days_ago(4), "114": "2026-10-12"})
+        rows = self.rows_of(self.lines("7610"))
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0].endswith(asof("2026-10-08")), rows[0])          # 115 年的列（收文日 2026-10-05）
+        self.assertIn("2026-10-05", rows[0])
+        self.assertNotIn("資料截至", rows[1])
+        self.assertIn("2025-03-01", rows[1])
+
+    def test_only_114_stale_marks_only_114_rows(self):
+        self.good([self.r115], [self.r114], check={"115": "2026-10-12", "114": days_ago(9)})
+        rows = self.rows_of(self.lines("7610"))
+        self.assertNotIn("資料截至", rows[0])
+        self.assertTrue(rows[1].endswith(asof("2026-10-03")), rows[1])
+
+    def test_both_stale_both_marked_with_their_own_dates(self):
+        self.good([self.r115], [self.r114], check={"115": days_ago(5), "114": days_ago(9)})
+        rows = self.rows_of(self.lines("7610"))
+        self.assertTrue(rows[0].endswith(asof("2026-10-07")), rows[0])
+        self.assertTrue(rows[1].endswith(asof("2026-10-03")), rows[1])
+        self.assertEqual(len(rows), 2)
+
+    def test_stale_year_with_no_match_says_so_in_the_no_match_line(self):
+        self.good([prow("2001")], [], check={"115": days_ago(4), "114": "2026-10-12"})
+        out = self.lines("7610")
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith(f"{HEAD}查無此證券代號"))
+
+    def test_only_115_missing_114_still_queried_and_the_skip_is_explained_in_the_line(self):
+        self.good([self.r115], [self.r114])
+        os.remove(os.path.join(self.d.dir, "parsed", "115.json"))
+        out = self.lines("7610")
+        rows = self.rows_of(out)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("2025-03-01", rows[0])
+        self.assertIn("⚠ 115年檔無可讀資料，未查該年度（原因：parsed/115.json 檔案不存在）", out[0])
+        self.assertNotIn("115年檔 v", out[0])                               # 資料版本只列實際查了的年度
+
+    def test_only_114_missing_115_still_queried(self):
+        self.good([self.r115], [self.r114])
+        self.d.write("meta/114.json", None, raw="{broken")
+        out = self.lines("7610")
+        self.assertEqual(len(self.rows_of(out)), 1)
+        self.assertIn("2026-10-05", self.rows_of(out)[0])
+        self.assertIn("⚠ 114年檔無可讀資料，未查該年度", out[0])
+
+    def test_missing_year_no_match_does_not_pretend_nothing_exists(self):
+        self.good([self.r115], [])
+        os.remove(os.path.join(self.d.dir, "parsed", "114.json"))
+        out = self.lines("9999")
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith(f"{HEAD}查無此證券代號"))
+        self.assertIn("⚠ 114年檔無可讀資料，未查該年度", out[0])
+
+    def test_one_missing_one_stale(self):
+        self.good([self.r115], [self.r114], check={"115": days_ago(6), "114": "2026-10-12"})
+        os.remove(os.path.join(self.d.dir, "parsed", "114.json"))
+        out = self.lines("7610")
+        rows = self.rows_of(out)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].endswith(asof("2026-10-06")))
+        self.assertIn("⚠ 114年檔無可讀資料", out[0])
+
+    def test_stale_marks_also_cover_anomaly_rows_of_that_year(self):
+        self.good([prow("7610", closing="駁回")], [self.r114], check={"115": days_ago(4), "114": "2026-10-12"})
+        bad = [ln for ln in self.lines("7610") if "資料異常：115年檔" in ln]
+        self.assertEqual(len(bad), 1)
+        self.assertTrue(bad[0].endswith(asof("2026-10-08")))
+
+    def test_old_rule_fallback_without_check_record(self):
+        # 沒有 _last_check.json：只有目前年度檔、此版本首次看到日超過 7 天才算過舊；「資料截至」取此版本首次看到日
+        self.d.year("115", [self.r115], first_seen=days_ago(8))
+        self.d.year("114", [self.r114], first_seen=days_ago(30))
+        rows = self.rows_of(self.lines("7610"))
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0].endswith(asof("2026-10-04")), rows[0])
+        self.assertNotIn("資料截至", rows[1])                                   # 備援規則下 114 年檔不判過舊（與區塊一致）
+        self.d.year("115", [self.r115], first_seen=days_ago(7))
+        self.assertNotIn("資料截至", "\n".join(self.lines("7610")))
+
+    def test_old_rule_with_corrupt_check_record(self):
+        self.good([self.r115], [self.r114], check=False)
+        self.d.write("_last_check.json", None, raw="{broken")
+        self.d.year("115", [self.r115], first_seen=days_ago(9))
+        rows = self.rows_of(self.lines("7610"))
+        self.assertTrue(rows[0].endswith(asof("2026-10-03")), rows[0])
+
+    def test_future_first_seen_year_is_skipped_other_year_queried(self):
+        self.d.year("115", [self.r115], first_seen=days_ago(-2))
+        self.d.year("114", [self.r114])
+        self.d.check({"115": "2026-10-12", "114": "2026-10-12"})
+        out = self.lines("7610")
+        self.assertEqual(len(self.rows_of(out)), 1)
+        self.assertIn("115年檔無可讀資料，未查該年度（原因：此版本首次看到日期", out[0])
+
+    def test_progress_block_warning_behaviour_is_unchanged(self):
+        self.good([self.r115], [self.r114], check={"115": days_ago(4), "114": "2026-10-12"})
+        rep = fp.build_report(NOW, self.d.dir)
+        self.assertEqual(rep.state, "過舊")
+        self.assertTrue(any("申報進度資料過舊(最後成功檢查 2026-10-08)" in r for r in rep.reasons))
+        self.good([self.r115], [self.r114])
+        os.remove(os.path.join(self.d.dir, "parsed", "114.json"))
+        self.assertEqual(fp.build_report(NOW, self.d.dir).state, "缺失")
 
 
 class TestRowAnomalies(Base):
@@ -258,7 +378,9 @@ class TestTimezone(Base):
         after = datetime(2026, 10, 12, 16, 0, tzinfo=timezone.utc)        # 台北 10-13 00:00：檢查日差 4 天 → 過舊
         b = self.lines("1001", before)
         self.assertIn("資料異常", "\n".join(b))
-        self.assertTrue(self.lines("1001", after)[0].startswith(f"{HEAD}申報表資料缺失/過舊"))
+        stale = self.lines("1001", after)                                  # 檢查日差 4 天 → 過舊：仍查，但行尾註明資料截至 2026-10-09
+        self.assertIn("（資料截至 2026-10-09，可能未更新）", "\n".join(stale))
+        self.assertNotIn("資料截至", "\n".join(b))
         self.good([prow("1001", closing="生效", eff="2026-10-13")], check={"115": "2026-10-13", "114": "2026-10-13"})
         ok = self.lines("1001", after)
         self.assertNotIn("資料異常", "\n".join(ok))
@@ -271,7 +393,10 @@ MARKERS = ("轉換公司債相關公告", "【轉換公司債", "無轉換公司
 
 class TestFormatterIntegration(Base):
     def render(self, rows, patch_lookup=None):
-        with mock.patch.dict(os.environ, {"FSC_DATA_DIR": self.d.dir}):
+        # 一律用合成資料（暫存目錄）＋固定的「現在」：complete_formatter 內部以 AnnouncementLookup() 建構、不傳 now，
+        # 沒有這個 patch 就會吃到真實時鐘，合成資料的「最後成功檢查日」一過 3 天就變成過舊、輸出跟著變（2026-11 起此測試因此失敗）。
+        real_today = fp.taipei_today
+        with mock.patch.dict(os.environ, {"FSC_DATA_DIR": self.d.dir}), mock.patch.object(fp, "taipei_today", lambda now=None: real_today(NOW)):
             f = cf.CompleteFormatter()
             return f.format_with_convertible_bond_priority(rows)
 
@@ -285,6 +410,7 @@ class TestFormatterIntegration(Base):
         self.assertLess(j, k)
         self.assertIn("（共 1 筆；", t[j:k])                                        # 用的是公告的證券代號 7610，不是公司名稱
         self.assertIn("已生效｜生效日期 2026-04-30", t[j:k])
+        self.assertNotIn("資料截至", t[j:k])                                       # 固定時鐘下資料是新鮮的，不得出現過舊註記
         self.assertEqual(t[i:j].rstrip("\n"), "🔎 公司情況研判：\n  ℹ 中性：可能規劃/進行可轉債")
         with mock.patch.object(cf.AnnouncementLookup, "lines_for", return_value=[]):
             base = self.render([ann("7610", "聯友金屬-創")])

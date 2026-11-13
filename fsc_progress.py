@@ -510,6 +510,13 @@ class Assessment:
     notes: List[str] = field(default_factory=list)
     checks: Dict[str, Tuple[str, Optional[date]]] = field(default_factory=dict)   # 年度 → (檢查紀錄狀態 ok|missing|corrupt, 最後成功檢查日)
     primary_source_age: Optional[int] = None
+    # 逐年度的判斷（給每則公告的查詢行用；區塊的警示行為只看上面的 reasons_*，不受這三個欄位影響）：
+    #   year_state: 年度 → ok | stale（資料可讀但過舊）| missing（缺失、損毀、版本不一致、時鐘異常：完全沒有可讀資料）
+    #   year_asof : 過舊年度的「資料截至」日 = 該年度最後成功檢查日；沒有可用的檢查紀錄（舊規則備援）時為此版本首次看到日
+    #   year_reason: 年度 → 缺失原因
+    year_state: Dict[str, str] = field(default_factory=dict)
+    year_asof: Dict[str, Optional[date]] = field(default_factory=dict)
+    year_reason: Dict[str, str] = field(default_factory=dict)
 
     @property
     def state(self) -> str:
@@ -523,11 +530,15 @@ def assess_sources(today: date, data_dir: str) -> Assessment:
     reasons_missing, reasons_stale = asm.reasons_missing, asm.reasons_stale
     fallback_labels, version_lines = asm.fallback_labels, asm.version_lines
     for yd in years:
+        asm.year_state[yd.year] = "ok"
         if not yd.ok:
             reasons_missing.append(f"{yd.year}年檔：{yd.error}")
+            asm.year_state[yd.year], asm.year_reason[yd.year] = "missing", yd.error
             continue
         if yd.first_seen > today:
             reasons_missing.append(f"{yd.year}年檔：此版本首次看到日期 {yd.first_seen} 晚於今日 {today}（時鐘或資料異常）")
+            asm.year_state[yd.year] = "missing"
+            asm.year_reason[yd.year] = f"此版本首次看到日期 {yd.first_seen} 晚於今日 {today}（時鐘或資料異常）"
             yd.ok = False
             continue
         src_age = (today - yd.first_seen).days
@@ -537,6 +548,7 @@ def assess_sources(today: date, data_dir: str) -> Assessment:
             check_txt = f"最近成功檢查 {last}"
             if (today - last).days > CHECK_STALE_DAYS:
                 reasons_stale.append(f"{yd.year}年檔：申報進度資料過舊(最後成功檢查 {last}),抓取可能失敗")
+                asm.year_state[yd.year], asm.year_asof[yd.year] = "stale", last
             elif src_age >= SOURCE_NOTE_MIN_DAYS:
                 extra_line = f"    └ 來源 {src_age} 天未更新(最近檢查 {last},正常)"
                 if yd.year == FSC_YEARS[0]:
@@ -547,6 +559,7 @@ def assess_sources(today: date, data_dir: str) -> Assessment:
             fallback_labels.append(why.split("（")[0])
             if yd.year == FSC_YEARS[0] and src_age > STALE_DAYS:
                 reasons_stale.append(f"{yd.year}年檔：{why}，暫以此版本首次看到日判斷：{src_age} 天前（{yd.first_seen}），超過 {STALE_DAYS} 天，可能已不是最新")
+                asm.year_state[yd.year], asm.year_asof[yd.year] = "stale", yd.first_seen
             else:
                 asm.notes.append(f"⚠️ {yd.year}年檔：{why}，暫以此版本首次看到日判斷（{src_age} 天前，未超過 {STALE_DAYS} 天）")
         asm.checks[yd.year] = (cstate, last)
@@ -717,7 +730,12 @@ class AnnouncementLookup:
     「轉換公司債(」開頭的同代號所有列。**不判斷哪一筆對應該則公告**：同代號的全部案件都列出，並註明。
 
     建構時只讀一次本機檔案（同一份報告內所有公告共用同一個評估結果與同一個「現在」）；建構與 lines_for 都不會拋例外，
-    也不會發任何網路請求。資料缺失／損毀／過舊（沿用既有判定 assess_sources）時不查詢，明確寫出原因，不拿可能過時的結果當最新。
+    也不會發任何網路請求。健康判定沿用 assess_sources，但**各年度分開處理**（單一年度的問題不得讓另一年度的查詢消失）：
+      過舊（資料可讀、但最後成功檢查日太久以前）：仍用該年度最後一版 parsed 查詢，該年度的每一筆結果行尾標
+        「（資料截至 YYYY-MM-DD，可能未更新）」，日期 = 該年度最後成功檢查日（沒有可用檢查紀錄的舊規則備援 → 此版本首次看到日）。
+      缺失／損毀（完全沒有可讀資料）：該年度不查，並在行內說明；其他年度照常。
+      所有年度都沒有可讀資料：維持「申報表資料缺失/過舊，未查詢（原因：…）」。
+    「📑 金管會申報進度」區塊的過舊警示不在這裡處理（仍由 build_report 以整體狀態判定）。
     """
 
     def __init__(self, now: Optional[datetime] = None, data_dir: Optional[str] = None):
@@ -725,12 +743,20 @@ class AnnouncementLookup:
         self.version_txt = ""
         self.unreadable = 0                      # 屬於轉換公司債範圍、但讀不出證券代號（無法歸屬任何公告）的列數
         self.index: Dict[str, List[Tuple[str, int, Any]]] = {}
+        self.stale: Dict[str, date] = {}         # 過舊但可讀的年度 → 資料截至日
+        self.skipped: Dict[str, str] = {}        # 完全沒有可讀資料而不查的年度 → 原因
         try:
             self.today = taipei_today(now)
             asm = assess_sources(self.today, data_dir or default_data_dir())
-            if asm.state != "正常":
+            usable = [y for y in FSC_YEARS if asm.year_state.get(y) in ("ok", "stale")]
+            if not usable:
                 self.error = "；".join(asm.reasons_missing + asm.reasons_stale)[:300] or asm.state
                 return
+            for y in FSC_YEARS:
+                if asm.year_state.get(y) == "missing":
+                    self.skipped[y] = (asm.year_reason.get(y) or "資料缺失")[:120]
+                elif asm.year_state.get(y) == "stale" and asm.year_asof.get(y):
+                    self.stale[y] = asm.year_asof[y]
             parts = []
             for yd in asm.years:
                 if not yd.ok:
@@ -754,6 +780,18 @@ class AnnouncementLookup:
         except Exception as e:
             self.error = f"讀取失敗（{type(e).__name__}）"
 
+    def _asof(self, year: str) -> str:
+        """過舊年度的結果行尾註記；其他年度為空字串。"""
+        d = self.stale.get(year)
+        return f"（資料截至 {d.isoformat()}，可能未更新）" if d else ""
+
+    def _year_notes(self) -> str:
+        """行內說明：哪些年度沒有查（缺失）、哪些年度的資料過舊。沒有問題時為空字串。"""
+        out = ""
+        for y, why in self.skipped.items():
+            out += f"；⚠ {y}年檔無可讀資料，未查該年度（原因：{why}）"
+        return out
+
     def lines_for(self, code: Any) -> List[str]:
         try:
             return self._lines_for(code)
@@ -769,6 +807,7 @@ class AnnouncementLookup:
         cands = self.index.get(code, [])
         if not cands:
             tail = f"；另有 {self.unreadable} 列無法解析的資料，結果可能不完整" if self.unreadable else ""
+            tail += self._year_notes()
             return [f"{LOOKUP_HEAD}查無此證券代號的轉換公司債申報案件（資料版本：{self.version_txt}；表為定期更新，查無不代表尚未送件）{tail}"]
         cases: List[Case] = []
         bad: List[str] = []
@@ -777,10 +816,10 @@ class AnnouncementLookup:
                 c = classify_row(year, row, self.today)
             except RowError as e:
                 xr = row.get("row") if isinstance(row, dict) else None
-                bad.append(f"  • 資料異常：{year}年檔 xlsx 第 {xr if xr is not None else '?'} 列 — {e}")
+                bad.append(f"  • 資料異常：{year}年檔 xlsx 第 {xr if xr is not None else '?'} 列 — {e}" + self._asof(year))
                 continue
             except Exception as e:
-                bad.append(f"  • 資料異常：{year}年檔 陣列位置 {idx} — 解析例外 {type(e).__name__}")
+                bad.append(f"  • 資料異常：{year}年檔 陣列位置 {idx} — 解析例外 {type(e).__name__}" + self._asof(year))
                 continue
             if c is not None:
                 cases.append(c)
@@ -788,7 +827,7 @@ class AnnouncementLookup:
         for c in cases:
             c.same_n = same[(c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS))]
         cases.sort(key=_recv_key)
-        rows_txt = [lookup_row_line(c) for c in cases] + bad
+        rows_txt = [lookup_row_line(c) + self._asof(c.year) for c in cases] + bad
         n = len(rows_txt)
         ver = f"資料版本：{self.version_txt}"
         # 行首固定註明「不判斷對應哪一次」。規格只要求同代號有多筆時加註；單筆也一律加註：
@@ -796,7 +835,7 @@ class AnnouncementLookup:
         head = f"{LOOKUP_HEAD}{AMBIGUOUS_NOTE}（共 {n} 筆；{ver}"
         if bad:
             head += f"；其中資料異常 {len(bad)} 列"
-        head += "）"
+        head += self._year_notes() + "）"
         out = [head] + rows_txt[:LOOKUP_MAX_ROWS]
         if n > LOOKUP_MAX_ROWS:
             out.append(f"  …另有 {n - LOOKUP_MAX_ROWS} 筆未列出")
