@@ -994,23 +994,53 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertIn("各年度檔", arch["name"])
         self.assertNotIn("不發訊息", self.wf["name"])
 
-    def test_archive_step_tees_log_and_keeps_the_exit_code(self):
+    def run_archive_snippet(self, fake_rc, snippet=None):
+        """把 workflow 裡「抓取並存檔」步驟的 run 原封不動寫成檔案，用 GitHub 預設的 `bash -e <檔>` 執行；
+        python3 換成假指令（PATH 最前面）：印一行 ::error:: 後以 fake_rc 結束。回傳 (結束碼, stdout, 存檔的 log 內容)。"""
         import subprocess
         arch = [s for s in self.steps if s.get("id") == "archive"][0]
-        self.assertIn("set -o pipefail", arch["run"])
+        self.assertNotIn("shell", arch)                                                     # 沒指定 shell → bash -e {0}
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.makedirs(os.path.join(d, "bin"))
         os.makedirs(os.path.join(d, "scripts"))
-        with open(os.path.join(d, "scripts", "archive_fsc.py"), "w") as f:
-            f.write("import sys\nprint('::error title=留存失敗 115年度申報案件::HTTP 500')\nsys.exit(1)\n")
-        env = {**os.environ, "RUNNER_TEMP": d}
-        r = subprocess.run(["bash", "-e", "-c", arch["run"]], cwd=d, capture_output=True, text=True, env=env)
-        self.assertEqual(r.returncode, 1)                                                     # 結束碼沒有被 tee 吃掉
-        self.assertIn("::error title=留存失敗 115年度申報案件::HTTP 500", r.stdout)             # 照常印到 log
+        with open(os.path.join(d, "bin", "python3"), "w") as f:
+            f.write("#!/bin/sh\necho '::error title=留存失敗 115年度申報案件::HTTP 500'\necho \"args: $*\"\nexit %d\n" % fake_rc)
+        os.chmod(os.path.join(d, "bin", "python3"), 0o755)
+        script = os.path.join(d, "step.sh")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(snippet if snippet is not None else arch["run"])
+        env = {**os.environ, "RUNNER_TEMP": d, "PATH": os.path.join(d, "bin") + os.pathsep + os.environ["PATH"]}
+        r = subprocess.run(["bash", "-e", script], cwd=d, capture_output=True, text=True, env=env)
         with open(os.path.join(d, "archive_fsc.log"), encoding="utf-8") as f:
-            self.assertIn("HTTP 500", f.read())                                               # 同時存檔給通知步驟
+            return r.returncode, r.stdout, f.read()
+
+    def test_archive_step_snippet_exit_code_is_the_commands_not_teess(self):
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        self.assertIn("set -o pipefail", arch["run"])
+        self.assertIn("python3 scripts/archive_fsc.py 2>&1 | tee \"$RUNNER_TEMP/archive_fsc.log\"", arch["run"])
+        rc, out, logged = self.run_archive_snippet(1)                                        # 會失敗的假指令
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=留存失敗 115年度申報案件::HTTP 500", out)                 # 照常印到 log（註解仍會產生）
+        self.assertIn("HTTP 500", logged)                                                    # 同時存檔給通知步驟
+        self.assertIn("args: scripts/archive_fsc.py", logged)
+        rc, out, logged = self.run_archive_snippet(0)                                        # 成功的假指令
+        self.assertEqual(rc, 0)
+        self.assertIn("HTTP 500", logged)
+        rc, _, _ = self.run_archive_snippet(3)                                               # 其他非 0 碼也原樣傳出
+        self.assertEqual(rc, 3)
         import fsc_alert
-        self.assertEqual([x.category for x in fsc_alert.parse_failures(open(os.path.join(d, "archive_fsc.log"), encoding="utf-8").read())], ["下載錯誤"])
+        rc, out, logged = self.run_archive_snippet(1)
+        self.assertEqual([f.category for f in fsc_alert.parse_failures(logged)], ["下載錯誤"])
+
+    def test_the_exit_code_test_is_sensitive_without_pipefail(self):
+        """對照組：拿掉 `set -o pipefail` 的同一片段，失敗的假指令會被 tee 蓋成 0——證明上面的測試真的抓得到這個漏洞。"""
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        broken = arch["run"].replace("set -o pipefail\n", "")
+        self.assertNotEqual(broken, arch["run"])
+        rc, _, _ = self.run_archive_snippet(1, snippet=broken)
+        self.assertEqual(rc, 0)
 
     def test_other_workflows_are_untouched_and_do_not_reference_the_alert_script(self):
         for name in os.listdir(os.path.join(ROOT, ".github", "workflows")):

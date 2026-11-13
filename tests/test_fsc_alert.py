@@ -391,15 +391,79 @@ class TestNeverSendsWhenItShouldNot(Base):
         for secret in (TOKEN, CHAT, GH):
             self.assertNotIn(secret, o)
 
-    def test_test_alert_previews_even_when_the_real_decision_would_be_silent(self):
+    def test_test_alert_on_a_successful_run_prints_both_synthetic_samples_and_never_sends(self):
+        """本次成功（真實決策是不發）時，test_alert 仍要印出一則失敗樣本與一則恢復樣本；全程不呼叫 Telegram。"""
+        with mock.patch("bot_relay.send_telegram_alert") as real_send:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = fa.main(self.env(ALERT_TEST="1", ARCHIVE_OUTCOME="success", TELEGRAM_BOT_TOKEN="", BOT_ALERT_CHAT_ID=""),
+                               opener=FakeApi([hist("success", "success")]))                  # send=None：若會送出就走 bot_relay
+            real_send.assert_not_called()
+        o = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("本次真實狀態不需要發送通知", o)
+        self.assertIn("【失敗樣本（合成資料", o)
+        self.assertIn("【恢復樣本（合成資料", o)
+        self.assertIn("證期局申報彙總表留存失敗", o)
+        self.assertIn("證期局申報彙總表留存已恢復", o)
+        self.assertEqual(o.count("【測試預覽，不會送出】"), 2)
+        self.assertIn("Telegram secrets 已被替換為空字串：是", o)
+        self.assertNotIn("::warning", o)
+        # 樣本是合成的：不含 fixtures 裡的真實檢查日（2026-11-13／2026-11-12），只有合成日期
+        for real in ("2026-11-13", "2026-11-12"):
+            self.assertNotIn(real, o)
+        self.assertEqual(o.count("（合成樣本）"), 2)
+
+    def test_test_alert_on_a_failed_run_also_prints_both_samples(self):
         self.write_log(LOG_115_GATE)
         code, out = self.go(FakeApi([hist("failure", "success")]), env=self.env(ALERT_TEST="1"))
         self.assertEqual(self.sent, [])
-        self.assertIn("【測試預覽，不會送出】", out)
+        self.assertIn("本次真實狀態不需要發送通知", out)         # 連續第 2 次：真實決策不發
+        self.assertIn("【失敗樣本（合成資料", out)
+        self.assertIn("【恢復樣本（合成資料", out)
         self.sent.clear()
-        code, out = self.go(FakeApi([hist("success")]), env=self.env(ALERT_TEST="1", ARCHIVE_OUTCOME="success"))
+        code, out = self.go(FakeApi([hist("success")]), env=self.env(ALERT_TEST="1"))
         self.assertEqual(self.sent, [])
-        self.assertIn("已恢復", out)
+        self.assertIn("【本次真實狀態會發送的內容（預覽，不送出）】", out)   # 連續第 1 次：另外預覽真實內容
+        self.assertIn("115年度申報案件（閘門擋下）", out)
+        self.assertIn("【失敗樣本（合成資料", out)
+
+    def test_samples_come_from_the_same_function_as_real_messages(self):
+        env = self.env()
+        fail_s, rec_s = fa.sample_messages(env)
+        real_fail = fa.build_message(env, fa.Decision("first", 1), True, [fa.Failure("115年度申報案件", fa.CAT_GATE)], False, self.fsc)
+        real_rec = fa.build_message(env, fa.Decision("recovered", 2), False, [], False, self.fsc)
+        keys = lambda m: [ln.split("：")[0] for ln in m.splitlines() if "：" in ln]
+        self.assertEqual(keys(fail_s), keys(real_fail))
+        self.assertEqual(keys(rec_s), keys(real_rec))
+        for m in (fail_s, rec_s):
+            for secret in (TOKEN, CHAT, GH):
+                self.assertNotIn(secret, m)
+            for s_ in SENT:
+                self.assertNotIn(s_, m)
+
+    def test_test_alert_with_non_empty_secrets_warns_but_still_never_sends(self):
+        with mock.patch("bot_relay.send_telegram_alert") as real_send:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                fa.main(self.env(ALERT_TEST="1"), opener=FakeApi([hist("success")]))        # env() 帶著 token／chat id
+            real_send.assert_not_called()
+        self.assertIn("::warning title=test_alert 時 secrets 應為空字串::", out.getvalue())
+        self.assertIn("已被替換為空字串：否", out.getvalue())
+        for secret in (TOKEN, CHAT, GH):
+            self.assertNotIn(secret, out.getvalue())
+
+    def test_test_alert_samples_are_printed_even_when_the_api_fails(self):
+        code, out = self.go(FakeApi(error=urllib.error.URLError("down")), env=self.env(ALERT_TEST="1", ARCHIVE_OUTCOME="success"))
+        self.assertEqual((code, self.sent), (0, []))
+        self.assertIn("【失敗樣本（合成資料", out)
+        self.assertIn("【恢復樣本（合成資料", out)
+
+    def test_dry_run_beats_test_alert(self):
+        api = FakeApi([hist("success")])
+        code, out = self.go(api, env=self.env(ALERT_TEST="1", ARCHIVE_DRY_RUN="1"))
+        self.assertEqual((self.sent, api.requests), ([], []))
+        self.assertNotIn("樣本", out)
 
     def test_there_is_no_env_switch_that_forces_a_real_send_in_test_mode(self):
         src = open(os.path.join(ROOT, "scripts", "fsc_alert.py"), encoding="utf-8").read()

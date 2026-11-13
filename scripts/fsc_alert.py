@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 REPEAT_EVERY = 6                 # 連續失敗每 6 次重發（6、12、18…）
 DRY_RUN_MARK = "dry-run"         # archive-fsc.yml 的 run-name 在 dry_run 時帶「（dry-run）」
@@ -236,8 +236,9 @@ def run_url(env: Dict[str, str]) -> str:
 
 
 def build_message(env: Dict[str, str], d: Decision, current_failed: bool, failures: List[Failure], commit_failed: bool,
-                  directory: str, test: bool = False) -> str:
+                  directory: str, test: bool = False, checks_text: Optional[str] = None) -> str:
     wf = env.get("GITHUB_WORKFLOW") or "留存證期局申報案件彙總表"
+    checks = checks_text if checks_text is not None else last_checks(directory)
     lines: List[str] = []
     if current_failed:
         if d.streak is None:
@@ -247,15 +248,28 @@ def build_message(env: Dict[str, str], d: Decision, current_failed: bool, failur
         head = "證期局申報彙總表留存失敗" + ("（仍未恢復）" if d.kind == "repeat" else "")
         lines += [head, f"workflow：{wf}", f"run：{run_url(env)}",
                   f"失敗項目：{describe_failures(failures, commit_failed, env.get('ARCHIVE_OUTCOME', ''))}",
-                  f"各年度最後成功檢查日：{last_checks(directory)}", streak_txt,
+                  f"各年度最後成功檢查日：{checks}", streak_txt,
                   "成功的年度已照常寫入；詳細原因請看 run 頁面的錯誤註解。"]
     else:
         lines += ["證期局申報彙總表留存已恢復", f"workflow：{wf}", f"run：{run_url(env)}",
                   f"先前連續失敗：{'至少 ' if d.at_least else ''}{d.streak} 次，本次兩個年度都成功",
-                  f"各年度最後成功檢查日：{last_checks(directory)}"]
+                  f"各年度最後成功檢查日：{checks}"]
     if test:
         lines.insert(0, "【測試預覽，不會送出】")
     return "\n".join(lines)
+
+
+# 測試樣本：test_alert=true 時，不論本次成功或失敗，都用「同一組函式」組出一則失敗樣本與一則恢復樣本印到 log。
+# 年度、類別、日期、次數全是合成的（不讀 _last_check.json、不讀 ::error:: 輸出），只有 workflow 名稱與 run 連結是本次 run 自己的資訊。
+SAMPLE_CHECKS = "114年=2026-01-01、115年=2026-01-01（合成樣本）"
+SAMPLE_FAILURES = [Failure("115年度申報案件", CAT_GATE), Failure("114年度申報案件", CAT_DOWNLOAD)]
+
+
+def sample_messages(env: Dict[str, str]) -> Tuple[str, str]:
+    """(失敗樣本, 恢復樣本)。與真實訊息同一個 build_message，內容是合成的。"""
+    fail = build_message(env, Decision("first", 1), True, SAMPLE_FAILURES, False, "", test=True, checks_text=SAMPLE_CHECKS)
+    rec = build_message(env, Decision("recovered", 3), False, [], False, "", test=True, checks_text=SAMPLE_CHECKS)
+    return fail, rec
 
 
 # ─────────────────────────────────────────
@@ -306,14 +320,26 @@ def _main(env: Dict[str, str], opener: Callable[..., Any], send: Optional[Callab
     log(f"判斷：本次{'失敗' if current_failed else '成功'}｜前幾次（新→舊）：{history if history is None else history[:8]}｜{d.reason}｜{'發送' if d.send else '不發'}")
 
     if test:
-        # 測試預覽：不管判斷結果，都組出「如果現在這個狀態要發」的訊息內容；絕不送出
-        if not current_failed and (d.streak is None or d.kind != "recovered"):
-            d = Decision("recovered", max(1, d.streak or 0), reason=d.reason)
-        elif current_failed and d.kind == "none":
-            d = Decision("repeat", d.streak, d.at_least, d.reason)
-        log("TEST_ALERT=true：以下是訊息內容預覽，不會送出（沒有呼叫 Telegram）：")
+        # 測試模式：只印、絕不送出（這個分支一定在送出之前 return；沒有任何會真實發送的開關）
+        secrets_empty = not (env.get("TELEGRAM_BOT_TOKEN") or env.get("BOT_ALERT_CHAT_ID"))
+        log(f"TEST_ALERT=true：不會呼叫 Telegram；Telegram secrets 已被替換為空字串：{'是' if secrets_empty else '否（異常，仍不會送出）'}")
+        if not secrets_empty:
+            log("::warning title=test_alert 時 secrets 應為空字串::workflow 的 env 設定可能被改動，請檢查；本次仍不會送出")
+        if d.send:
+            log("【本次真實狀態會發送的內容（預覽，不送出）】")
+            log("----")
+            log(build_message(env, d, current_failed, failures, commit_failed, directory, test=True))
+            log("----")
+        else:
+            log("本次真實狀態不需要發送通知（見上方判斷）。")
+        fail_sample, rec_sample = sample_messages(env)
+        log("【失敗樣本（合成資料，與真實訊息同一組函式產生）】")
         log("----")
-        log(build_message(env, d, current_failed, failures, commit_failed, directory, test=True))
+        log(fail_sample)
+        log("----")
+        log("【恢復樣本（合成資料，與真實訊息同一組函式產生）】")
+        log("----")
+        log(rec_sample)
         log("----")
         return 0
     if not d.send:
