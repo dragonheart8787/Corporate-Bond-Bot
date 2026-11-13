@@ -907,7 +907,9 @@ class TestWorkflowContract(unittest.TestCase):
     def test_triggers_dispatch_with_dry_run_and_two_daily_crons_on_unused_minutes(self):
         on = self.wf[True]
         self.assertEqual(set(on), {"schedule", "workflow_dispatch"})
-        self.assertEqual(set(on["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert"})
+        self.assertEqual(set(on["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert", "send_test"})
+        self.assertEqual(on["workflow_dispatch"]["inputs"]["send_test"]["type"], "boolean")
+        self.assertIs(on["workflow_dispatch"]["inputs"]["send_test"]["default"], False)
         self.assertEqual(on["workflow_dispatch"]["inputs"]["dry_run"]["default"], "false")
         self.assertEqual(on["workflow_dispatch"]["inputs"]["test_alert"]["default"], "false")
         self.assertEqual(on["workflow_dispatch"]["inputs"]["test_alert"]["options"], ["false", "true"])
@@ -958,13 +960,18 @@ class TestWorkflowContract(unittest.TestCase):
 
     def test_notify_step_contract(self):
         n = self.notify_step()
-        self.assertIs(n["continue-on-error"], True)
         self.assertEqual(n["run"], "python3 scripts/fsc_alert.py")
         self.assertIn("!cancelled()", n["if"])
         self.assertIn("github.event.inputs.dry_run != 'true'", n["if"])                      # dry_run 不通知
+        self.assertIn("steps.validate.outcome == 'success'", n["if"])                        # 輸入檢查沒過就不會進到通知（含送訊）
+        # 一般通知永遠不影響結果；只有 send_test（管道測試）時送訊失敗才讓 run 變紅
+        self.assertEqual(n["continue-on-error"], "${{ github.event.inputs.send_test != 'true' }}")
         env = n["env"]
         self.assertEqual(set(env), {"TELEGRAM_BOT_TOKEN", "BOT_ALERT_CHAT_ID", "GH_API_TOKEN", "ARCHIVE_OUTCOME", "COMMIT_OUTCOME", "ARCHIVE_LOG",
-                                    "ARCHIVE_DRY_RUN", "ALERT_TEST", "ALERT_WORKFLOW_FILE"})
+                                    "ARCHIVE_DRY_RUN", "ALERT_TEST", "ALERT_WORKFLOW_FILE", "ALERT_EVENT_NAME", "ALERT_REF", "SEND_TEST"})
+        self.assertEqual(env["ALERT_REF"], "${{ github.ref }}")
+        self.assertEqual(env["ALERT_EVENT_NAME"], "${{ github.event_name }}")
+        self.assertEqual(env["SEND_TEST"], "${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && github.event.inputs.send_test == 'true' && '1' || '0' }}")
         # test_alert=true 時 secrets 被換成空字串（不能用 `cond && '' || secret`：空字串是 falsy，會誤取 secret）
         for name, secret in (("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"), ("BOT_ALERT_CHAT_ID", "TELEGRAM_CHAT_ID")):
             self.assertEqual(env[name], "${{ github.event.inputs.test_alert != 'true' && secrets.%s || '' }}" % secret)
@@ -974,18 +981,28 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertEqual(env["ALERT_TEST"], "${{ github.event.inputs.test_alert == 'true' && '1' || '0' }}")
         self.assertEqual(env["ALERT_WORKFLOW_FILE"], "archive-fsc.yml")
 
-    def test_no_real_send_test_switch(self):
+    def test_the_only_real_send_switch_is_send_test_and_it_is_dispatch_only(self):
         self.assertNotRegex(self.code.lower(), r"force|real_send|send_for_real")
-        self.assertEqual(set(self.wf[True]["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert"})
+        self.assertEqual(set(self.wf[True]["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert", "send_test"})
+        self.assertEqual(set(self.wf[True]), {"schedule", "workflow_dispatch"})
+        self.assertIn("github.event_name == 'workflow_dispatch'", self.notify_step()["env"]["SEND_TEST"])
+        self.assertIn("github.ref == 'refs/heads/master'", self.notify_step()["env"]["SEND_TEST"])          # 雙重檢查之一
+        validate = [s for s in self.steps if s.get("id") == "validate"][0]
+        self.assertEqual(validate["env"]["REF"], "${{ github.ref }}")
+        self.assertIn('[ "$REF" != "refs/heads/master" ]', validate["run"])                                  # 雙重檢查之二
 
     def test_step_order_and_run_name_marker(self):
         ids = [s.get("id") for s in self.steps]
+        self.assertEqual(ids[0], "validate")                                                  # 輸入檢查是最早的步驟（早於 checkout）
+        self.assertLess(ids.index("validate"), self.steps.index([s for s in self.steps if "uses" in s][0]))
         self.assertLess(ids.index("archive"), ids.index("commit"))
         self.assertLess(ids.index("commit"), ids.index("notify"))
         self.assertLess(self.steps.index(self.notify_step()), self.steps.index(self.steps[-1]))
         import fsc_alert
         self.assertIn(fsc_alert.DRY_RUN_MARK, self.wf["run-name"])
         self.assertIn("github.event.inputs.dry_run == 'true'", self.wf["run-name"])
+        self.assertIn(fsc_alert.SEND_TEST_MARK, self.wf["run-name"])
+        self.assertIn("github.event.inputs.send_test == 'true'", self.wf["run-name"])
 
     def test_step_names_no_longer_claim_xlsx_only(self):
         arch = [s for s in self.steps if s.get("id") == "archive"][0]

@@ -1,7 +1,7 @@
 name: 留存證期局申報案件彙總表（只存檔；失敗才通知）
 
-# run-name 在 dry_run 時帶「（dry-run）」，通知邏輯靠它把 dry_run 排除在「前幾次 run」之外
-run-name: 留存證期局申報案件彙總表${{ github.event.inputs.dry_run == 'true' && '（dry-run）' || '' }}
+# run-name 在 dry_run 時帶「（dry-run）」、send_test 時帶「（管道測試）」，通知邏輯靠它把這兩類 run 排除在「前幾次 run」之外
+run-name: 留存證期局申報案件彙總表${{ github.event.inputs.dry_run == 'true' && '（dry-run）' || '' }}${{ github.event.inputs.send_test == 'true' && '（管道測試）' || '' }}
 
 # 目的：每天抓金管會證期局「申報案件辦理情形彙總表」的 115、114 兩個年度檔（有 .xlsx 用 .xlsx；115 年自 2026-10-21 起只有 .ods，改用 .ods），原檔逐位元留存，
 # 並產生完整解析（parsed）、版本資訊（meta）與新舊版差異（diffs），供之後離線評估。只留存，不接進日報、不接進 /cb。
@@ -11,7 +11,10 @@ run-name: 留存證期局申報案件彙總表${{ github.event.inputs.dry_run ==
 # 抓取與存檔本身不使用任何 secrets、不觸發其他 workflow；唯一的寫入是把 data/fsc/ 提交回分支。
 # 失敗通知：只有「🔔 失敗／恢復通知」那一個步驟會用到 Telegram secrets（與 daily.yml 告警相同的 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID），
 #   並用 github.token（actions: read）查本 workflow 前幾次 run。判斷規則見 scripts/fsc_alert.py：連續失敗第 1 次、每 6 次重發、失敗後恢復時發；
-#   dry_run 不通知；test_alert=true 只把訊息印到 log、不送出（沒有任何會真實發送的測試開關）。通知失敗只寫 ::warning::，不影響失敗閘門。
+#   dry_run 不通知；test_alert=true 只把訊息印到 log、不送出。通知失敗只寫 ::warning::，不影響失敗閘門。
+# 管道測試：send_test=true（只能手動 dispatch，且 dry_run=false、test_alert=false）是唯一會「真實送出一則固定測試訊息」的入口：
+#   不抓取、不查詢前幾次 run、不提交、不寫檔；送訊失敗（HTTP 非 2xx、secret 缺失、chat id 錯誤、逾時）會讓 run 變紅。
+#   不合法的組合在最早的步驟（任何網路請求之前）就 ::error:: 並失敗；只能在 master 分支上執行。schedule 等其他觸發不可能進入送訊。
 # 資料使用條款見 data/fsc/SOURCE.md（引用須註明來源、不得任意增刪、不得商業使用）。
 on:
   schedule:
@@ -30,13 +33,18 @@ on:
           - "false"
           - "true"
       test_alert:
-        description: "true = 只把通知訊息內容印到 log（預覽），絕不送出；沒有任何會真實發送的測試開關"
+        description: "true = 只把通知訊息內容印到 log（預覽），絕不送出"
         required: false
         default: "false"
         type: choice
         options:
           - "false"
           - "true"
+      send_test:
+        description: "true = 管道測試：只真實送出一則固定的測試訊息到 Telegram（不抓取、不提交）；只能搭配 dry_run=false 與 test_alert=false"
+        required: false
+        default: false
+        type: boolean
 
 # contents: write 僅為把存檔提交回分支；actions: read 僅為通知步驟查詢本 workflow 前幾次 run 的結果。沒有 actions: write，沒有其他權限。
 permissions:
@@ -53,6 +61,23 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # 最早的步驟（早於 checkout 與任何網路請求）：send_test 只能單獨使用。違反就失敗，後面的步驟（含通知）都不會執行。
+      - name: 🧪 輸入檢查（send_test 不可與 dry_run、test_alert 並用，只能手動 dispatch，且只能在 master 上）
+        id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          TEST_ALERT: ${{ github.event.inputs.test_alert }}
+          SEND_TEST: ${{ github.event.inputs.send_test }}
+        run: |
+          if [ "$SEND_TEST" = "true" ]; then
+            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$REF" != "refs/heads/master" ] || [ "$DRY_RUN" = "true" ] || [ "$TEST_ALERT" = "true" ]; then
+              echo "::error title=send_test 輸入不合法::send_test=true 只能手動 dispatch、只能在 master 分支上執行，且必須搭配 dry_run=false 與 test_alert=false。沒有抓取、沒有送出任何訊息。"
+              exit 1
+            fi
+          fi
+
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
@@ -60,6 +85,7 @@ jobs:
       # 這裡用 continue-on-error 讓後面的提交照跑，最後再由「失敗閘門」把 run 變紅。
       - name: 🗄️ 抓取並存檔（頁面 1 + 各年度檔 1：有 .xlsx 用 .xlsx、否則用 .ods；間隔 ≥ 6 秒，不重試）
         id: archive
+        if: ${{ github.event.inputs.send_test != 'true' }}
         continue-on-error: true
         env:
           ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
@@ -106,10 +132,11 @@ jobs:
 
       # 只有這個步驟用到 secrets。continue-on-error：通知本身出任何問題都不能影響結果（程式也永遠以 0 結束，只寫 ::warning::）。
       # test_alert=true 時 secrets 被換成空字串，程式也不會呼叫 Telegram（雙重保險）；dry_run 不執行。
-      - name: 🔔 失敗／恢復通知（連續失敗第 1 次、每 6 次重發、失敗後恢復；dry_run 與 test_alert 不送出）
+      # send_test 時這個步驟改為「管道測試」：continue-on-error 為 false，送訊失敗會讓 run 變紅（一般通知則永遠不影響結果）。
+      - name: 🔔 失敗／恢復通知（連續失敗第 1 次、每 6 次重發、失敗後恢復；send_test 時為管道測試；dry_run 與 test_alert 不送出）
         id: notify
-        if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' }}
-        continue-on-error: true
+        if: ${{ !cancelled() && steps.validate.outcome == 'success' && github.event.inputs.dry_run != 'true' }}
+        continue-on-error: ${{ github.event.inputs.send_test != 'true' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ github.event.inputs.test_alert != 'true' && secrets.TELEGRAM_BOT_TOKEN || '' }}
           BOT_ALERT_CHAT_ID: ${{ github.event.inputs.test_alert != 'true' && secrets.TELEGRAM_CHAT_ID || '' }}
@@ -120,6 +147,9 @@ jobs:
           ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
           ALERT_TEST: ${{ github.event.inputs.test_alert == 'true' && '1' || '0' }}
           ALERT_WORKFLOW_FILE: archive-fsc.yml
+          ALERT_EVENT_NAME: ${{ github.event_name }}
+          ALERT_REF: ${{ github.ref }}
+          SEND_TEST: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && github.event.inputs.send_test == 'true' && '1' || '0' }}
         run: python3 scripts/fsc_alert.py
 
       - name: 🚦 失敗閘門（抓取有任何失敗就讓 run 變紅）
