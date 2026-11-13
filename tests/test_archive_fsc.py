@@ -907,8 +907,10 @@ class TestWorkflowContract(unittest.TestCase):
     def test_triggers_dispatch_with_dry_run_and_two_daily_crons_on_unused_minutes(self):
         on = self.wf[True]
         self.assertEqual(set(on), {"schedule", "workflow_dispatch"})
-        self.assertEqual(set(on["workflow_dispatch"]["inputs"]), {"dry_run"})
+        self.assertEqual(set(on["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert"})
         self.assertEqual(on["workflow_dispatch"]["inputs"]["dry_run"]["default"], "false")
+        self.assertEqual(on["workflow_dispatch"]["inputs"]["test_alert"]["default"], "false")
+        self.assertEqual(on["workflow_dispatch"]["inputs"]["test_alert"]["options"], ["false", "true"])
         crons = [c["cron"] for c in on["schedule"]]
         self.assertEqual(len(crons), 2)
         used = set()
@@ -924,11 +926,128 @@ class TestWorkflowContract(unittest.TestCase):
             self.assertNotIn(f[0], used, c)
         self.assertEqual(len({c.split()[0] for c in crons}), 2)
 
-    def test_permissions_contents_write_only_no_secrets_no_telegram_no_dispatch(self):
-        self.assertEqual(self.wf["permissions"], {"contents": "write"})
+    NOTIFY_SECRETS = {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}          # 與 daily.yml 告警步驟相同的兩個名稱
+
+    def notify_step(self):
+        return [s for s in self.steps if s.get("id") == "notify"][0]
+
+    def test_permissions_are_exactly_contents_write_and_actions_read(self):
+        self.assertEqual(self.wf["permissions"], {"contents": "write", "actions": "read"})
         self.assertNotIn("permissions", self.wf["jobs"]["archive"])
-        for forbidden in ("secrets.", "TELEGRAM", "api.telegram.org", "/dispatches", "gh api", "actions: write", "workflow_run", "bot_relay", "GITHUB_TOKEN"):
+        for forbidden in ("actions: write", "/dispatches", "gh api", "workflow_run", "GITHUB_TOKEN", "api.telegram.org", "bot_relay"):
             self.assertNotIn(forbidden, self.code, forbidden)
+
+    def test_secrets_appear_only_in_the_notify_step_and_only_the_two_daily_names(self):
+        import json as _json
+        names = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", self.code))
+        self.assertEqual(names, self.NOTIFY_SECRETS)
+        for st in self.steps:
+            blob = _json.dumps(st, ensure_ascii=False)
+            if st.get("id") == "notify":
+                self.assertEqual(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", blob)), self.NOTIFY_SECRETS)
+            else:
+                self.assertNotIn("secrets.", blob, st.get("name"))
+                self.assertNotIn("TELEGRAM", blob, st.get("name"))
+                self.assertNotIn("BOT_ALERT", blob, st.get("name"))
+        self.assertNotIn("secrets.", _json.dumps({k: v for k, v in self.wf.items() if k != "jobs"}, ensure_ascii=False, default=str))
+        self.assertNotIn("secrets.", _json.dumps({k: v for k, v in self.wf["jobs"]["archive"].items() if k != "steps"}, ensure_ascii=False))
+        # 與 daily.yml 實際使用的名稱一致（先讀 daily.yml，不猜）
+        daily = open(os.path.join(ROOT, ".github", "workflows", "daily.yml"), encoding="utf-8").read()
+        for n in self.NOTIFY_SECRETS:
+            self.assertIn("secrets." + n, daily)
+
+    def test_notify_step_contract(self):
+        n = self.notify_step()
+        self.assertIs(n["continue-on-error"], True)
+        self.assertEqual(n["run"], "python3 scripts/fsc_alert.py")
+        self.assertIn("!cancelled()", n["if"])
+        self.assertIn("github.event.inputs.dry_run != 'true'", n["if"])                      # dry_run 不通知
+        env = n["env"]
+        self.assertEqual(set(env), {"TELEGRAM_BOT_TOKEN", "BOT_ALERT_CHAT_ID", "GH_API_TOKEN", "ARCHIVE_OUTCOME", "COMMIT_OUTCOME", "ARCHIVE_LOG",
+                                    "ARCHIVE_DRY_RUN", "ALERT_TEST", "ALERT_WORKFLOW_FILE"})
+        # test_alert=true 時 secrets 被換成空字串（不能用 `cond && '' || secret`：空字串是 falsy，會誤取 secret）
+        for name, secret in (("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"), ("BOT_ALERT_CHAT_ID", "TELEGRAM_CHAT_ID")):
+            self.assertEqual(env[name], "${{ github.event.inputs.test_alert != 'true' && secrets.%s || '' }}" % secret)
+        self.assertEqual(env["GH_API_TOKEN"], "${{ github.token }}")
+        self.assertEqual(env["ARCHIVE_OUTCOME"], "${{ steps.archive.outcome }}")
+        self.assertEqual(env["COMMIT_OUTCOME"], "${{ steps.commit.outcome }}")
+        self.assertEqual(env["ALERT_TEST"], "${{ github.event.inputs.test_alert == 'true' && '1' || '0' }}")
+        self.assertEqual(env["ALERT_WORKFLOW_FILE"], "archive-fsc.yml")
+
+    def test_no_real_send_test_switch(self):
+        self.assertNotRegex(self.code.lower(), r"force|real_send|send_for_real")
+        self.assertEqual(set(self.wf[True]["workflow_dispatch"]["inputs"]), {"dry_run", "test_alert"})
+
+    def test_step_order_and_run_name_marker(self):
+        ids = [s.get("id") for s in self.steps]
+        self.assertLess(ids.index("archive"), ids.index("commit"))
+        self.assertLess(ids.index("commit"), ids.index("notify"))
+        self.assertLess(self.steps.index(self.notify_step()), self.steps.index(self.steps[-1]))
+        import fsc_alert
+        self.assertIn(fsc_alert.DRY_RUN_MARK, self.wf["run-name"])
+        self.assertIn("github.event.inputs.dry_run == 'true'", self.wf["run-name"])
+
+    def test_step_names_no_longer_claim_xlsx_only(self):
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        self.assertNotIn("xlsx 2", arch["name"])
+        self.assertIn(".ods", arch["name"])
+        self.assertIn("各年度檔", arch["name"])
+        self.assertNotIn("不發訊息", self.wf["name"])
+
+    def run_archive_snippet(self, fake_rc, snippet=None):
+        """把 workflow 裡「抓取並存檔」步驟的 run 原封不動寫成檔案，用 GitHub 預設的 `bash -e <檔>` 執行；
+        python3 換成假指令（PATH 最前面）：印一行 ::error:: 後以 fake_rc 結束。回傳 (結束碼, stdout, 存檔的 log 內容)。"""
+        import subprocess
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        self.assertNotIn("shell", arch)                                                     # 沒指定 shell → bash -e {0}
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.makedirs(os.path.join(d, "bin"))
+        os.makedirs(os.path.join(d, "scripts"))
+        with open(os.path.join(d, "bin", "python3"), "w") as f:
+            f.write("#!/bin/sh\necho '::error title=留存失敗 115年度申報案件::HTTP 500'\necho \"args: $*\"\nexit %d\n" % fake_rc)
+        os.chmod(os.path.join(d, "bin", "python3"), 0o755)
+        script = os.path.join(d, "step.sh")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(snippet if snippet is not None else arch["run"])
+        env = {**os.environ, "RUNNER_TEMP": d, "PATH": os.path.join(d, "bin") + os.pathsep + os.environ["PATH"]}
+        r = subprocess.run(["bash", "-e", script], cwd=d, capture_output=True, text=True, env=env)
+        with open(os.path.join(d, "archive_fsc.log"), encoding="utf-8") as f:
+            return r.returncode, r.stdout, f.read()
+
+    def test_archive_step_snippet_exit_code_is_the_commands_not_teess(self):
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        self.assertIn("set -o pipefail", arch["run"])
+        self.assertIn("python3 scripts/archive_fsc.py 2>&1 | tee \"$RUNNER_TEMP/archive_fsc.log\"", arch["run"])
+        rc, out, logged = self.run_archive_snippet(1)                                        # 會失敗的假指令
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)
+        self.assertIn("::error title=留存失敗 115年度申報案件::HTTP 500", out)                 # 照常印到 log（註解仍會產生）
+        self.assertIn("HTTP 500", logged)                                                    # 同時存檔給通知步驟
+        self.assertIn("args: scripts/archive_fsc.py", logged)
+        rc, out, logged = self.run_archive_snippet(0)                                        # 成功的假指令
+        self.assertEqual(rc, 0)
+        self.assertIn("HTTP 500", logged)
+        rc, _, _ = self.run_archive_snippet(3)                                               # 其他非 0 碼也原樣傳出
+        self.assertEqual(rc, 3)
+        import fsc_alert
+        rc, out, logged = self.run_archive_snippet(1)
+        self.assertEqual([f.category for f in fsc_alert.parse_failures(logged)], ["下載錯誤"])
+
+    def test_the_exit_code_test_is_sensitive_without_pipefail(self):
+        """對照組：拿掉 `set -o pipefail` 的同一片段，失敗的假指令會被 tee 蓋成 0——證明上面的測試真的抓得到這個漏洞。"""
+        arch = [s for s in self.steps if s.get("id") == "archive"][0]
+        broken = arch["run"].replace("set -o pipefail\n", "")
+        self.assertNotEqual(broken, arch["run"])
+        rc, _, _ = self.run_archive_snippet(1, snippet=broken)
+        self.assertEqual(rc, 0)
+
+    def test_other_workflows_are_untouched_and_do_not_reference_the_alert_script(self):
+        for name in os.listdir(os.path.join(ROOT, ".github", "workflows")):
+            if name in ("archive-fsc.yml",):
+                continue
+            t = open(os.path.join(ROOT, ".github", "workflows", name), encoding="utf-8").read()
+            self.assertNotIn("fsc_alert", t, name)
 
     def test_independent_concurrency_never_cancels(self):
         c = self.wf["concurrency"]
@@ -958,13 +1077,16 @@ class TestWorkflowContract(unittest.TestCase):
         self.assertNotIn("${{", arch["run"])
         self.assertEqual(set(arch["env"]), {"ARCHIVE_DRY_RUN", "PROBE_REPO"})
         commit = [s for s in self.steps if "push_with_retry.sh" in s.get("run", "")][0]
+        self.assertEqual(commit["id"], "commit")
         gate = self.steps[-1]
         self.assertLess(self.steps.index(arch), self.steps.index(commit))
         self.assertLess(self.steps.index(commit), self.steps.index(gate))
         self.assertIn("steps.archive.outcome == 'failure'", gate["if"])
         self.assertIn("always()", gate["if"])
         self.assertIn("exit 1", gate["run"])
-        self.assertEqual(arch["run"], "python3 scripts/archive_fsc.py")
+        self.assertIn("python3 scripts/archive_fsc.py", arch["run"])
+        self.assertNotIn("TELEGRAM", gate["run"])
+        self.assertNotIn("env", gate)                                                         # 失敗閘門本身沒有 secrets
 
 
 @unittest.skipIf(yaml is None, "需要 PyYAML")

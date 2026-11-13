@@ -1,11 +1,17 @@
-name: 留存證期局申報案件彙總表（只存檔，不發訊息）
+name: 留存證期局申報案件彙總表（只存檔；失敗才通知）
 
-# 目的：每天抓金管會證期局「申報案件辦理情形彙總表」的 115、114 兩個年度 xlsx，原檔逐位元留存，
+# run-name 在 dry_run 時帶「（dry-run）」，通知邏輯靠它把 dry_run 排除在「前幾次 run」之外
+run-name: 留存證期局申報案件彙總表${{ github.event.inputs.dry_run == 'true' && '（dry-run）' || '' }}
+
+# 目的：每天抓金管會證期局「申報案件辦理情形彙總表」的 115、114 兩個年度檔（有 .xlsx 用 .xlsx；115 年自 2026-10-21 起只有 .ods，改用 .ods），原檔逐位元留存，
 # 並產生完整解析（parsed）、版本資訊（meta）與新舊版差異（diffs），供之後離線評估。只留存，不接進日報、不接進 /cb。
 # 為什麼 114 年也要每天查：該檔在 2026 年仍會被更新，不是一次性。
 #
-# 請求：頁面 1 次 + 兩個年度 xlsx 各 1 次（共 ≤ 3 次），間隔 ≥ 6 秒，不跟隨轉址，不重試；xlsx 連結每次從頁面解析。
-# 不使用任何 secrets、不碰 Telegram、不觸發其他 workflow。唯一的寫入是把 data/fsc/ 提交回分支。
+# 請求：頁面 1 次 + 兩個年度檔各 1 次（共 ≤ 3 次），間隔 ≥ 6 秒，不跟隨轉址，不重試；連結每次從頁面解析。
+# 抓取與存檔本身不使用任何 secrets、不觸發其他 workflow；唯一的寫入是把 data/fsc/ 提交回分支。
+# 失敗通知：只有「🔔 失敗／恢復通知」那一個步驟會用到 Telegram secrets（與 daily.yml 告警相同的 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID），
+#   並用 github.token（actions: read）查本 workflow 前幾次 run。判斷規則見 scripts/fsc_alert.py：連續失敗第 1 次、每 6 次重發、失敗後恢復時發；
+#   dry_run 不通知；test_alert=true 只把訊息印到 log、不送出（沒有任何會真實發送的測試開關）。通知失敗只寫 ::warning::，不影響失敗閘門。
 # 資料使用條款見 data/fsc/SOURCE.md（引用須註明來源、不得任意增刪、不得商業使用）。
 on:
   schedule:
@@ -23,10 +29,19 @@ on:
         options:
           - "false"
           - "true"
+      test_alert:
+        description: "true = 只把通知訊息內容印到 log（預覽），絕不送出；沒有任何會真實發送的測試開關"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
-# contents: write 僅為把存檔提交回分支；沒有 actions: write，沒有其他權限。
+# contents: write 僅為把存檔提交回分支；actions: read 僅為通知步驟查詢本 workflow 前幾次 run 的結果。沒有 actions: write，沒有其他權限。
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: archive-fsc
@@ -43,15 +58,19 @@ jobs:
 
       # 某個年度失敗也不能讓另一個年度已成功的資料白抓：腳本把成功的年度寫完、整體以非 0 結束，
       # 這裡用 continue-on-error 讓後面的提交照跑，最後再由「失敗閘門」把 run 變紅。
-      - name: 🗄️ 抓取並存檔（頁面 1 + xlsx 2，間隔 ≥ 6 秒，不重試）
+      - name: 🗄️ 抓取並存檔（頁面 1 + 各年度檔 1：有 .xlsx 用 .xlsx、否則用 .ods；間隔 ≥ 6 秒，不重試）
         id: archive
         continue-on-error: true
         env:
           ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
           PROBE_REPO: ${{ github.repository }}
-        run: python3 scripts/archive_fsc.py
+        # 輸出同時存檔，給通知步驟分類失敗原因（pipefail：結束碼仍是 python 的）
+        run: |
+          set -o pipefail
+          python3 scripts/archive_fsc.py 2>&1 | tee "$RUNNER_TEMP/archive_fsc.log"
 
       - name: 📝 提交存檔（pull --rebase、重試；最終失敗會讓 run 變紅）
+        id: commit
         if: ${{ !cancelled() && steps.archive.outcome != 'skipped' }}
         env:
           # 不走預設的 Telegram 告警：本 workflow 不碰 Telegram，最終失敗只靠 ::error:: 與紅色 run
@@ -84,6 +103,24 @@ jobs:
           fi
           git commit -m "archive: 證期局申報彙總表 $(TZ=Asia/Taipei date +%F)"
           bash scripts/push_with_retry.sh
+
+      # 只有這個步驟用到 secrets。continue-on-error：通知本身出任何問題都不能影響結果（程式也永遠以 0 結束，只寫 ::warning::）。
+      # test_alert=true 時 secrets 被換成空字串，程式也不會呼叫 Telegram（雙重保險）；dry_run 不執行。
+      - name: 🔔 失敗／恢復通知（連續失敗第 1 次、每 6 次重發、失敗後恢復；dry_run 與 test_alert 不送出）
+        id: notify
+        if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ github.event.inputs.test_alert != 'true' && secrets.TELEGRAM_BOT_TOKEN || '' }}
+          BOT_ALERT_CHAT_ID: ${{ github.event.inputs.test_alert != 'true' && secrets.TELEGRAM_CHAT_ID || '' }}
+          GH_API_TOKEN: ${{ github.token }}
+          ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
+          COMMIT_OUTCOME: ${{ steps.commit.outcome }}
+          ARCHIVE_LOG: ${{ runner.temp }}/archive_fsc.log
+          ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          ALERT_TEST: ${{ github.event.inputs.test_alert == 'true' && '1' || '0' }}
+          ALERT_WORKFLOW_FILE: archive-fsc.yml
+        run: python3 scripts/fsc_alert.py
 
       - name: 🚦 失敗閘門（抓取有任何失敗就讓 run 變紅）
         if: ${{ always() && steps.archive.outcome == 'failure' }}
