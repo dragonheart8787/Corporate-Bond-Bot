@@ -407,8 +407,8 @@ class TestDiffSection(Base):
         sec = t.split("🔄 較上次資料版本的變動（115年檔")[1].split("（以上為申報進度")[0]
         self.assertIn("新增 1、消失 1、欄位變動 2", sec)
         self.assertIn("新增：1001 新增公司｜無擔保｜9.00億 台幣", sec)
-        self.assertIn("消失：3003｜有擔保", sec)
-        self.assertIn("變動：1002 變動公司｜無擔保｜收文日期（送件）2026-10-01｜結案類型：— → 生效", sec)
+        self.assertIn("消失：3003｜有擔保｜4.00億｜收文日期（送件）2026-09-01", sec)           # 消失的列也顯示金額（取自 diff 的 id）
+        self.assertIn("變動：1002 變動公司｜無擔保｜1.00億 台幣｜收文日期（送件）2026-10-01｜結案類型：— → 生效", sec)
         self.assertIn("生效日期：— → 2026-10-08", sec)
         for noise in ("9999", "8888", "7777"):
             self.assertNotIn(noise, sec)

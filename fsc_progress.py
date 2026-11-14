@@ -232,6 +232,13 @@ class Case:
         return norm(self.fields.get(col))
 
 
+def case_key(year: str, fields: Dict[str, Any], seq: int) -> str:
+    """列的完整識別：年度｜證券代號｜案件類別｜收文日期｜金額#重複序號。與 archive_fsc 寫進 parsed／diffs 的 id（key#dup_seq）同一格式。
+    金額一定要在裡面：同日同類別常有多筆不同金額的案件（例如同一天送件的 90 億與 10 億），少了金額這些列會被當成同一筆。"""
+    parts = [norm(fields.get(c)) for c in ("證券代號", "案件類別", "收文日期", "金額")]
+    return f"{year}|{'|'.join(parts)}#{seq}"
+
+
 def classify_row(year: str, row: Any, today: date) -> Optional[Case]:
     """回傳 Case；非轉換公司債三類回傳 None；異常拋 RowError。"""
     if not isinstance(row, dict):
@@ -253,7 +260,7 @@ def classify_row(year: str, row: Any, today: date) -> Optional[Case]:
     seq = row.get("dup_seq") if isinstance(row.get("dup_seq"), int) else 1
     receipt, _ = single_date(fields.get("收文日期"))
     c = Case(year, row.get("row"), seq, fields, [str(f) for f in flags], "", closing, code, category, receipt,
-             f"{year}|{code}|{category}|{norm(fields.get('收文日期'))}|{seq}")
+             case_key(year, fields, seq))
     if closing == "":
         c.status = "reviewing"
     elif closing == "生效":
@@ -367,8 +374,28 @@ def _diff_value(col: str, v: Any) -> str:
     return fmt_date_cell(t) if col.endswith("日期") else t
 
 
-def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[List[str], Dict[str, int]]:
-    """CB 三類限定的新增／消失／欄位變動。回傳 (行, 計數)。"""
+def fmt_amount_from_id(raw: str) -> str:
+    """只有 diff 的 id 可用（例如已消失、不在目前版本的列）時的金額顯示：同樣以億為單位，但不帶幣別（id 不含幣別）。"""
+    raw = norm(raw)
+    if not raw:
+        return f"金額 {DASH}"
+    if _NUM.fullmatch(raw):
+        return f"{float(raw) / 1e8:.2f}億"
+    return f"金額 {raw}（非純數字，原樣顯示）"
+
+
+DIFF_BAD_MISSING = "（diff 記錄異常：目前版本找不到對應列，金額取自 diff 記錄的 id）"
+DIFF_BAD_AMBIGUOUS = "（diff 記錄異常：目前版本有多列使用同一個 id，無法確定是哪一列）"
+DIFF_BAD_DUPLICATE = "（diff 記錄異常：diff 檔重複記錄同一項目）"
+
+
+def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case], collided: Optional[set] = None) -> Tuple[List[str], Dict[str, int]]:
+    """
+    CB 三類限定的新增／消失／欄位變動。回傳 (行, 計數)。
+    diff 項目對應到目前版本的列，一律用「完整的 id」（證券代號｜案件類別｜收文日期｜金額#重複序號）精確查找，不做任何部分比對；
+    每一行都顯示金額（取自對應列；找不到對應列時取自 id）。對應不上、id 重複等情況不顯示猜測的內容，而是明確標示「diff 記錄異常」。
+    """
+    collided = collided or set()
     counts = {"added": 0, "vanished": 0, "changed": 0, "bad": 0, "dup_listed": 0}
     path = find_diff_file(data_dir, yd)
     head = f"🔄 較上次資料版本的變動（{yd.year}年檔，此版本於 {yd.first_seen} 首次看到）"
@@ -389,6 +416,20 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
     def is_cb(parts: Tuple[str, ...]) -> bool:
         return norm(parts[1]).startswith(CB_PREFIX)
 
+    def resolve(raw_id: str, parts: Tuple[str, ...]) -> Tuple[Optional[Case], str]:
+        """(對應的列或 None, 異常標示)。只用完整 id 查：金額與重複序號都在 id 裡。"""
+        key = f"{yd.year}|{norm(raw_id)}"
+        if key in collided:
+            return None, DIFF_BAD_AMBIGUOUS
+        c = lookup.get(key)
+        if c is None:
+            return None, DIFF_BAD_MISSING
+        return c, ""
+
+    seen_added: set = set()
+    seen_vanished: set = set()
+    seen_changed: set = set()
+
     for i in obj["added"]:
         p = _id_parts(i)
         if p is None:
@@ -396,11 +437,18 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
             continue
         if not is_cb(p):
             continue
-        counts["added"] += 1
-        c = lookup.get(f"{yd.year}|{p[0]}|{norm(p[1])}|{p[2]}|{p[4]}")
-        who = f"{c.code} {c.get('公司名稱') or DASH}｜{short_category(c.category)}｜{fmt_amount(c.fields)}" if c else f"{p[0]}｜{short_category(p[1])}"
+        c, bad = resolve(i, p)
+        if i in seen_added:
+            bad = DIFF_BAD_DUPLICATE
+        seen_added.add(i)
+        if bad:
+            counts["bad"] += 1
+        if bad != DIFF_BAD_DUPLICATE:
+            counts["added"] += 1
+        name = f" {c.get('公司名稱') or DASH}" if c else ""
+        amount = fmt_amount(c.fields) if c else fmt_amount_from_id(p[3])
         counts["dup_listed"] += 1 if c is not None and c.same_n >= 2 else 0
-        items.append([f"  • 新增：{who}｜收文日期（送件）{fmt_date_cell(p[2])}{dup_note(c)}"])
+        items.append([f"  • 新增：{p[0]}{name}｜{short_category(p[1])}｜{amount}｜收文日期（送件）{fmt_date_cell(p[2])}{dup_note(c)}{bad}"])
     for i in obj["vanished"]:
         p = _id_parts(i)
         if p is None:
@@ -408,8 +456,13 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
             continue
         if not is_cb(p):
             continue
-        counts["vanished"] += 1
-        items.append([f"  • 消失：{p[0]}｜{short_category(p[1])}｜收文日期（送件）{fmt_date_cell(p[2])}"])
+        bad = DIFF_BAD_DUPLICATE if i in seen_vanished else ""
+        seen_vanished.add(i)
+        if bad:
+            counts["bad"] += 1
+        else:
+            counts["vanished"] += 1
+        items.append([f"  • 消失：{p[0]}｜{short_category(p[1])}｜{fmt_amount_from_id(p[3])}｜收文日期（送件）{fmt_date_cell(p[2])}{bad}"])
     for ch in obj["changed"]:
         if not isinstance(ch, dict):
             counts["bad"] += 1
@@ -421,12 +474,20 @@ def diff_section(data_dir: str, yd: YearData, lookup: Dict[str, Case]) -> Tuple[
             continue
         if not is_cb(p):
             continue
-        counts["changed"] += 1
-        c = lookup.get(f"{yd.year}|{p[0]}|{norm(p[1])}|{p[2]}|{p[4]}")
+        c, bad = resolve(ch["id"], p)
+        pair = (ch["id"], col)
+        if pair in seen_changed:
+            bad = DIFF_BAD_DUPLICATE
+        seen_changed.add(pair)
+        if bad:
+            counts["bad"] += 1
+        if bad != DIFF_BAD_DUPLICATE:
+            counts["changed"] += 1
         name = c.get("公司名稱") if c and c.get("公司名稱") else DASH
+        amount = fmt_amount(c.fields) if c else fmt_amount_from_id(p[3])
         counts["dup_listed"] += 1 if c is not None and c.same_n >= 2 else 0
-        items.append([f"  • 變動：{p[0]} {name}｜{short_category(p[1])}｜收文日期（送件）{fmt_date_cell(p[2])}｜"
-                      f"{col}：{_diff_value(col, ch.get('old'))} → {_diff_value(col, ch.get('new'))}{dup_note(c)}"])
+        items.append([f"  • 變動：{p[0]} {name}｜{short_category(p[1])}｜{amount}｜收文日期（送件）{fmt_date_cell(p[2])}｜"
+                      f"{col}：{_diff_value(col, ch.get('old'))} → {_diff_value(col, ch.get('new'))}{dup_note(c)}{bad}"])
     lines = [head, f"  新增 {counts['added']}、消失 {counts['vanished']}、欄位變動 {counts['changed']}"
                    + (f"（其中 {counts['dup_listed']} 筆屬於來源表中完全相同的重複列，各自獨立計入）" if counts["dup_listed"] else "")
                    + (f"（另有 {counts['bad']} 筆資料異常）" if counts["bad"] else "")]
@@ -607,6 +668,7 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
     cases: List[Case] = []
     anomalies: List[str] = []
     lookup: Dict[str, Case] = {}
+    collided: set = set()                       # 同一個完整 id 出現在多列（parsed 檔異常）：diff 無法確定對應哪一列
     for yd in good:
         for idx, row in enumerate(yd.rows):
             try:
@@ -620,6 +682,8 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
                 continue
             if c is not None:
                 cases.append(c)
+                if c.key in lookup:
+                    collided.add(c.key)
                 lookup[c.key] = c
     same = collections.Counter((c.year, tuple(str(c.fields.get(col, "")) for col in EXPECTED_COLUMNS)) for c in cases)
     for c in cases:
@@ -655,7 +719,7 @@ def build_report(now: Optional[datetime] = None, data_dir: Optional[str] = None)
         lines.extend(_cap_items([[terminated_line(c)] for c in term_recent]) if term_recent else ["  （無）"])
         for yd in good:
             if (today - yd.first_seen).days <= DIFF_DAYS:
-                dl, dc = diff_section(data_dir, yd, lookup)
+                dl, dc = diff_section(data_dir, yd, lookup, collided)
                 if not dl:                 # 首次留存（沒有前一版）：不顯示這一段
                     continue
                 rep.counts["diff"][yd.year] = dc
