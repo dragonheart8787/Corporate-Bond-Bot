@@ -1,0 +1,23 @@
+{
+ "added": [
+  "5848|合併|1151116|40461489170#1"
+ ],
+ "changed": [],
+ "counts": {
+  "added": 1,
+  "changed_fields": 0,
+  "new_rows": 724,
+  "old_rows": 723,
+  "vanished": 0
+ },
+ "format_change": false,
+ "new_format": "ods",
+ "new_sha256": "75abd310437c2b1747c35b9c03c04eff032ce603753052b5b1625ee3ab5969b7",
+ "new_version_date": "2026-11-17",
+ "old_format": "ods",
+ "old_sha256": "8742a16e36ea7378651c2b723fccf10e433679df87a6ef3da1cfedad9e7857ea",
+ "old_version_date": "2026-11-16",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
