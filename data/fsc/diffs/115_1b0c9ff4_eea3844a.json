@@ -1,0 +1,31 @@
+{
+ "added": [
+  "6574|轉換公司債(無擔保)|1151118|100000000#1",
+  "6574|轉換公司債(無擔保)|1151118|100000000#2"
+ ],
+ "changed": [
+  {
+   "field": "結案類型",
+   "id": "2345|現金增資|1151103|100000000#1",
+   "new": "生效",
+   "old": ""
+  }
+ ],
+ "counts": {
+  "added": 2,
+  "changed_fields": 1,
+  "new_rows": 731,
+  "old_rows": 729,
+  "vanished": 0
+ },
+ "format_change": false,
+ "new_format": "ods",
+ "new_sha256": "eea3844aba038f9b500f90b5ff7d9cabdfe98b0781aa38453dd85a8f07fd224e",
+ "new_version_date": "2026-11-19",
+ "old_format": "ods",
+ "old_sha256": "1b0c9ff41cf1a4125488af5bd11527e45fdb7ee1ac807fcbe550ac133dfb0499",
+ "old_version_date": "2026-11-18",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
