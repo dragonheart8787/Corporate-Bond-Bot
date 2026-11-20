@@ -19,11 +19,11 @@
   "退件日期",
   "案件性質"
  ],
- "file_version": "",
- "filename_decoded": "1151119申報案件彙總表1.ods",
- "filename_original": "1151119%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A81.ods",
- "filename_safe": "1151119申報案件彙總表1.ods",
- "first_seen": "2026-11-19",
+ "file_version": "1",
+ "filename_decoded": "1151120申報v1.ods",
+ "filename_original": "1151120%E7%94%B3%E5%A0%B1v1.ods",
+ "filename_safe": "1151120申報v1.ods",
+ "first_seen": "2026-11-20",
  "header_row": 3,
  "history": [
   {
@@ -121,11 +121,19 @@
    "sha256": "eea3844aba038f9b500f90b5ff7d9cabdfe98b0781aa38453dd85a8f07fd224e",
    "sha8": "eea3844a",
    "size": 52575
+  },
+  {
+   "filename": "1151120申報v1.ods",
+   "first_seen": "2026-11-20",
+   "format": "ods",
+   "sha256": "514cac30b4afb9b26393ad5c46b324c75a5c700d0c21c034330a8b3d33248083",
+   "sha8": "514cac30",
+   "size": 52574
   }
  ],
  "link_text": "ODS",
- "page_update_text": "2026-11-19",
- "reference_date": "2026-11-19",
+ "page_update_text": "2026-11-20",
+ "reference_date": "2026-11-20",
  "row_counts": {
   "blank_rows": 0,
   "data_rows": 731,
@@ -133,15 +141,15 @@
   "trailer_rows": 0,
   "trailing_blank_rows": 0
  },
- "sha256": "eea3844aba038f9b500f90b5ff7d9cabdfe98b0781aa38453dd85a8f07fd224e",
+ "sha256": "514cac30b4afb9b26393ad5c46b324c75a5c700d0c21c034330a8b3d33248083",
  "sheet_name": "IMP0080A_Upload",
- "size": 52575,
- "source_date_filename": "2026-11-19",
- "source_date_page": "2026-11-19",
+ "size": 52574,
+ "source_date_filename": "2026-11-20",
+ "source_date_page": "2026-11-20",
  "source_ext": ".ods",
  "source_format": "ods",
  "source_page": "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52",
- "source_url": "https://www.fsc.gov.tw/userfiles/file/1151119%E7%94%B3%E5%A0%B1%E6%A1%88%E4%BB%B6%E5%BD%99%E7%B8%BD%E8%A1%A81.ods",
+ "source_url": "https://www.fsc.gov.tw/userfiles/file/1151120%E7%94%B3%E5%A0%B1v1.ods",
  "trailer_rows": [],
  "version": 1,
  "year": "115",

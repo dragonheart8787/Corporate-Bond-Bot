@@ -1,0 +1,34 @@
+{
+ "added": [],
+ "changed": [
+  {
+   "field": "結案類型",
+   "id": "6176|員工認股權憑證|1151111|38000000#1",
+   "new": "生效",
+   "old": ""
+  },
+  {
+   "field": "結案類型",
+   "id": "7715|現金增資|1151104|100000000#1",
+   "new": "生效",
+   "old": ""
+  }
+ ],
+ "counts": {
+  "added": 0,
+  "changed_fields": 2,
+  "new_rows": 731,
+  "old_rows": 731,
+  "vanished": 0
+ },
+ "format_change": false,
+ "new_format": "ods",
+ "new_sha256": "514cac30b4afb9b26393ad5c46b324c75a5c700d0c21c034330a8b3d33248083",
+ "new_version_date": "2026-11-20",
+ "old_format": "ods",
+ "old_sha256": "eea3844aba038f9b500f90b5ff7d9cabdfe98b0781aa38453dd85a8f07fd224e",
+ "old_version_date": "2026-11-19",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
