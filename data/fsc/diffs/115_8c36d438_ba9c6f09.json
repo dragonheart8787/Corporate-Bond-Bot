@@ -1,0 +1,46 @@
+{
+ "added": [],
+ "changed": [
+  {
+   "field": "結案類型",
+   "id": "6483|現金增資|1151113|100000000#1",
+   "new": "生效",
+   "old": ""
+  },
+  {
+   "field": "結案類型",
+   "id": "7610|轉換公司債(無擔保)|1151106|2000000000#1",
+   "new": "生效",
+   "old": ""
+  },
+  {
+   "field": "結案類型",
+   "id": "7788|轉換公司債(無擔保)|1151106|1500000000#1",
+   "new": "生效",
+   "old": ""
+  },
+  {
+   "field": "結案類型",
+   "id": "7928|現金增資|1151113|30000000#1",
+   "new": "生效",
+   "old": ""
+  }
+ ],
+ "counts": {
+  "added": 0,
+  "changed_fields": 4,
+  "new_rows": 739,
+  "old_rows": 739,
+  "vanished": 0
+ },
+ "format_change": false,
+ "new_format": "ods",
+ "new_sha256": "ba9c6f09e4dafea78a2136cb153ebffab631cf7b6fb83ec6897919f11ef32e52",
+ "new_version_date": "2026-11-24",
+ "old_format": "ods",
+ "old_sha256": "8c36d4380168152535d1ba44b7c7a1571f1ae4f507ac81fa525f339be77c73a9",
+ "old_version_date": "2026-11-23",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
