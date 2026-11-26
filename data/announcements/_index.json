@@ -800,6 +800,22 @@
     "tpex": 50,
     "twse": 111
    }
+  },
+  "20261126": {
+   "filtered": 4,
+   "filtered_by_source": {
+    "twse": 4
+   },
+   "keywords_in_filtered": {
+    "申報生效": 1,
+    "競價拍賣": 0,
+    "董事會": 2,
+    "送件": 0
+   },
+   "total": 99,
+   "total_by_source": {
+    "twse": 99
+   }
   }
  },
  "version": 1
