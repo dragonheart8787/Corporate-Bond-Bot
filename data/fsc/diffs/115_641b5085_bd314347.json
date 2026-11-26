@@ -1,0 +1,24 @@
+{
+ "added": [
+  "3265|現金增資|1151125|169500000#1",
+  "6166|轉換公司債(無擔保)|1151125|2500000000#1"
+ ],
+ "changed": [],
+ "counts": {
+  "added": 2,
+  "changed_fields": 0,
+  "new_rows": 741,
+  "old_rows": 739,
+  "vanished": 0
+ },
+ "format_change": false,
+ "new_format": "ods",
+ "new_sha256": "bd314347dcb18e9e1593cdfa21c6a5f68e318d728315d1a144a39a4c469b5d38",
+ "new_version_date": "2026-11-26",
+ "old_format": "ods",
+ "old_sha256": "641b50852d295582b4bb09a739ca6cc0c5b0fd424a0316646564e46fcae494b3",
+ "old_version_date": "2026-11-25",
+ "vanished": [],
+ "version": 1,
+ "year": "115"
+}
